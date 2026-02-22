@@ -8,8 +8,7 @@ import scanner_config as cfg
 import requests
 
 
-from datetime import datetime, timedelta, timezone
-from typing import Optional
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ============================================================
@@ -18,7 +17,7 @@ from zoneinfo import ZoneInfo
 # ============================================================
 LOOKBACK_DAYS     = getattr(cfg, "LOOKBACK_DAYS", 2000)
 MIN_RR            = getattr(cfg, "MIN_RR", 1.8)
-MAX_BUY_PER_DAY   = getattr(cfg, "MAX_BUY_PER_DAY", 10)
+MAX_BUY_PER_DAY   = getattr(cfg, "MAX_BUY_PER_DAY", 5)
 RISK_PER_TRADE    = getattr(cfg, "RISK_PER_TRADE", 0.005)
 ACCOUNT_EQUITY_USD = getattr(cfg, "ACCOUNT_EQUITY_USD", 10000)
 
@@ -165,7 +164,7 @@ def _get_single_df_from_download(data, ticker: str):
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
                         # ✅ 장중 변동 방지: 오늘(진행중) 일봉은 신호 계산에서 제외
-            today = datetime.now(timezone.utc).date()
+            today = datetime.utcnow().date()
             try:
                 last_dt = pd.to_datetime(df.index[-1]).date()
                 if last_dt >= today:
@@ -180,159 +179,28 @@ def _get_single_df_from_download(data, ticker: str):
         return None
 
 
-def _get_df_for_regime(data, ticker: str):
-    """MultiIndex에서 ticker 추출. ^VIX -> VIX 등 별칭 시도."""
-    df = _get_single_df_from_download(data, ticker)
-    if df is not None and not df.empty:
-        return df
-    if ticker == "^VIX":
-        df = _get_single_df_from_download(data, "VIX")
-        if df is not None and not df.empty:
-            return df
-    return None
-
-
 def compute_market_state_from_data(data):
-    """
-    다지표 종합 시장 레짐 (100점 만점).
-    - 지수 다변화(SPY/QQQ/IWM vs SMA50·SMA200)
-    - SPY ADX(추세 강도)
-    - VIX 수준
-    - SPY 거래대금 비율(20일 평균 vs 최근 5일)
-    - 섹터 로테이션(QQQ vs XLP 상대강도)
-    → 0-33 RISK_OFF, 34-66 CAUTION, 67-100 RISK_ON
-    """
-    out = {
-        "regime": "UNKNOWN",
-        "score": None,
-        "spy_sma50": None,
-        "spy_sma200": None,
-        "indices": {},
-        "adx_spy": None,
-        "vix": None,
-        "spy_vol_ratio": None,
-        "sector_qqq_vs_xlp": None,
-        "components": {},
-    }
-    df_spy = _get_df_for_regime(data, "SPY")
+    df_spy = _get_single_df_from_download(data, "SPY")
     if df_spy is None or df_spy.empty:
-        return out
+        return {"regime": "UNKNOWN", "spy_sma50": None, "spy_sma200": None}
+
     df_spy = df_spy.dropna(subset=["Close"]).copy()
     if len(df_spy) < 220:
-        return out
+        return {"regime": "UNKNOWN", "spy_sma50": None, "spy_sma200": None}
 
-    close_spy = df_spy["Close"]
-    sma50_spy = float(sma(close_spy, 50).iloc[-1])
-    sma200_spy = float(sma(close_spy, 200).iloc[-1])
-    out["spy_sma50"] = round(sma50_spy, 2)
-    out["spy_sma200"] = round(sma200_spy, 2)
+    close = df_spy["Close"]
+    sma50 = float(sma(close, 50).iloc[-1])
+    sma200 = float(sma(close, 200).iloc[-1])
+    last_close = float(close.iloc[-1])
 
-    # ---- 1) 지수 다변화 (SPY, QQQ, IWM) vs SMA50/SMA200 → 최대 30점
-    indices_score = 0.0
-    for sym, label in [("SPY", "SPY"), ("QQQ", "QQQ"), ("IWM", "IWM")]:
-        df = _get_df_for_regime(data, sym)
-        above50, above200 = None, None
-        if df is not None and len(df) >= 200 and "Close" in df.columns:
-            c = df["Close"].dropna()
-            if len(c) >= 50:
-                s50 = sma(c, 50).iloc[-1]
-                s200 = sma(c, 200).iloc[-1] if len(c) >= 200 else np.nan
-                last = float(c.iloc[-1])
-                above50 = last > float(s50) if np.isfinite(s50) else None
-                above200 = last > float(s200) if np.isfinite(s200) else None
-                if above50:
-                    indices_score += 5.0
-                if above200:
-                    indices_score += 5.0
-            out["indices"][label] = {"above_sma50": above50, "above_sma200": above200}
-        else:
-            out["indices"][label] = {"above_sma50": above50, "above_sma200": above200}
-    indices_score = min(30.0, indices_score)
-    out["components"]["indices"] = round(indices_score, 1)
-
-    # ---- 2) SPY ADX(추세 강도) → 최대 15점
-    adx_score = 0.0
-    try:
-        adx_ser = adx(df_spy, 14)
-        if adx_ser is not None and len(adx_ser) > 0:
-            adx_val = float(adx_ser.iloc[-1])
-            out["adx_spy"] = round(adx_val, 1)
-            if adx_val >= 20:
-                if close_spy.iloc[-1] > float(sma(close_spy, 20).iloc[-1]):
-                    adx_score = 15.0
-                else:
-                    adx_score = -15.0
-            else:
-                adx_score = 0.0
-        out["components"]["adx"] = round(adx_score, 1)
-    except Exception:
-        out["components"]["adx"] = 0.0
-
-    # ---- 3) VIX 수준 → 최대 20점
-    vix_score = 0.0
-    df_vix = _get_df_for_regime(data, "^VIX")
-    if df_vix is not None and not df_vix.empty and "Close" in df_vix.columns:
-        vix_val = float(df_vix["Close"].iloc[-1])
-        out["vix"] = round(vix_val, 1)
-        if vix_val < 15:
-            vix_score = 20.0
-        elif vix_val < 20:
-            vix_score = 10.0
-        elif vix_val < 25:
-            vix_score = 0.0
-        elif vix_val < 30:
-            vix_score = -10.0
-        else:
-            vix_score = -20.0
-    out["components"]["vix"] = round(vix_score, 1)
-
-    # ---- 4) SPY 거래대금 비율 → 최대 15점
-    vol_score = 0.0
-    if "Volume" in df_spy.columns and len(df_spy) >= 20:
-        vol = pd.to_numeric(df_spy["Volume"], errors="coerce").fillna(0)
-        avg20 = vol.tail(20).mean()
-        avg5 = vol.tail(5).mean()
-        if avg5 and avg5 > 0 and np.isfinite(avg20):
-            ratio = float(avg20) / float(avg5)
-            out["spy_vol_ratio"] = round(ratio, 2)
-            if ratio >= 1.0:
-                vol_score = 15.0
-            elif ratio >= 0.7:
-                vol_score = 0.0
-            else:
-                vol_score = -15.0
-    out["components"]["vol_ratio"] = round(vol_score, 1)
-
-    # ---- 5) 섹터 로테이션 QQQ vs XLP → 최대 20점
-    sector_score = 0.0
-    df_qqq = _get_df_for_regime(data, "QQQ")
-    df_xlp = _get_df_for_regime(data, "XLP")
-    if df_qqq is not None and df_xlp is not None and len(df_qqq) >= 50 and len(df_xlp) >= 50:
-        qqq_c = df_qqq["Close"].dropna()
-        xlp_c = df_xlp["Close"].dropna()
-        qqq_above = float(qqq_c.iloc[-1]) > float(sma(qqq_c, 50).iloc[-1])
-        xlp_above = float(xlp_c.iloc[-1]) > float(sma(xlp_c, 50).iloc[-1])
-        if qqq_above and not xlp_above:
-            sector_score = 20.0
-        elif qqq_above and xlp_above:
-            sector_score = 10.0
-        elif not qqq_above and xlp_above:
-            sector_score = -10.0
-        else:
-            sector_score = -20.0
-        out["sector_qqq_vs_xlp"] = "growth_lead" if sector_score > 0 else "defensive_lead" if sector_score < 0 else "neutral"
-    out["components"]["sector"] = round(sector_score, 1)
-
-    raw = indices_score + adx_score + vix_score + vol_score + sector_score
-    score = max(0.0, min(100.0, 50.0 + raw * 0.5))
-    out["score"] = round(score, 1)
-    if score <= 33.0:
-        out["regime"] = "RISK_OFF"
-    elif score <= 66.0:
-        out["regime"] = "CAUTION"
+    if (last_close < sma50) and (last_close < sma200):
+        regime = "RISK_OFF"
+    elif last_close < sma200:
+        regime = "CAUTION"
     else:
-        out["regime"] = "RISK_ON"
-    return out
+        regime = "RISK_ON"
+
+    return {"regime": regime, "spy_sma50": round(sma50, 2), "spy_sma200": round(sma200, 2)}
 
 
 def data_quality_check(df: pd.DataFrame, end_date: datetime.date, max_stale_days: int = 5):
@@ -643,13 +511,13 @@ def decide_entry(df2):
                     f"SMA50({sma50:.2f}) 이탈 또는 Stop {stop:.2f}",
                     "종가확인/윗꼬리/갭 통과 → 진짜 돌파 진입")
 
-        # ✅ BUY는 아니고 WATCH로만 내림(가짜 돌파 방지) — note에 실제 탈락 사유(돌파 품질) 기록
+        # ✅ BUY는 아니고 WATCH로만 내림(가짜 돌파 방지)
         if ok_watch:
             return ("WATCH_BREAKOUT",
                     f"트리거: {high20_prev:.2f} 상향 돌파(20D High) | 품질: {q_reason}",
                     f"{high20_prev:.2f} 위 '종가확인' + 거래량 유지 시",
                     f"SMA50({sma50:.2f}) 이탈 또는 Stop {stop:.2f}",
-                    f"돌파 품질 미충족: {q_reason} (Vol {vol_ratio:.2f}x, 기준 {buy_vol_x}x)")
+                    f"현재 Vol {vol_ratio:.2f}x (BUY 기준 {buy_vol_x}x)")
 
 
     # WATCH_BREAKOUT
@@ -1107,113 +975,8 @@ def print_positions(path="positions.csv"):
     print(df.to_string(index=False))
 
 
-def _trading_days_between(ref_date, end_date) -> int:
-    """ref_date ~ end_date (포함) 사이의 거래일(평일) 수. US 기준 월~금."""
-    try:
-        if hasattr(ref_date, "date"):
-            ref_date = ref_date.date()
-        if hasattr(end_date, "date"):
-            end_date = end_date.date()
-        ref_date = pd.Timestamp(ref_date).date()
-        end_date = pd.Timestamp(end_date).date()
-    except Exception:
-        return 0
-    if end_date < ref_date:
-        return 0
-    n = 0
-    d = ref_date
-    while d <= end_date:
-        if d.weekday() < 5:  # 0=Mon .. 4=Fri
-            n += 1
-        d += timedelta(days=1)
-    return n
 
-
-def _next_earnings_date(ticker: str, ref_date) -> Optional[object]:
-    """다음 실적 발표일(date). 없으면 None."""
-    try:
-        if hasattr(ref_date, "date"):
-            ref_date = ref_date.date()
-        ref_date = pd.Timestamp(ref_date).date()
-    except Exception:
-        return None
-    future_dates = []
-    try:
-        t = yf.Ticker(ticker)
-        if hasattr(t, "get_earnings_dates"):
-            ed_df = t.get_earnings_dates(limit=8)
-            if ed_df is not None and not ed_df.empty and hasattr(ed_df.index, "tolist"):
-                for d in ed_df.index.tolist():
-                    try:
-                        earn_d = pd.Timestamp(d).date()
-                        if earn_d >= ref_date:
-                            future_dates.append(earn_d)
-                    except Exception:
-                        continue
-        if not future_dates and hasattr(t, "calendar"):
-            cal = getattr(t, "calendar", None)
-            if isinstance(cal, dict) and "Earnings Date" in cal:
-                ed = cal["Earnings Date"]
-                if isinstance(ed, (list, tuple)) and len(ed) > 0:
-                    for x in ed:
-                        try:
-                            d = pd.Timestamp(x).date()
-                            if d >= ref_date:
-                                future_dates.append(d)
-                        except Exception:
-                            continue
-                elif ed is not None:
-                    try:
-                        d = pd.Timestamp(ed).date()
-                        if d >= ref_date:
-                            future_dates.append(d)
-                    except Exception:
-                        pass
-        if not future_dates and hasattr(t, "info"):
-            info = t.info or {}
-            for key in ("earningsDate", "nextEarningsDate"):
-                ed = info.get(key)
-                if ed is not None:
-                    try:
-                        if isinstance(ed, (list, tuple)) and len(ed) > 0:
-                            ed = ed[0]
-                        d = pd.Timestamp(ed).date()
-                        if d >= ref_date:
-                            future_dates.append(d)
-                        break
-                    except Exception:
-                        continue
-        return min(future_dates) if future_dates else None
-    except Exception:
-        return None
-
-
-def _days_until_next_earnings(ticker: str, ref_date) -> Optional[int]:
-    """
-    다음 실적 발표일까지 남은 캘린더 일수. ref_date 기준 미래 실적일만 고려.
-    """
-    next_earnings = _next_earnings_date(ticker, ref_date)
-    if next_earnings is None:
-        return None
-    try:
-        if hasattr(ref_date, "date"):
-            ref_date = ref_date.date()
-        ref_date = pd.Timestamp(ref_date).date()
-        delta = (next_earnings - ref_date).days
-        return delta if delta >= 0 else None
-    except Exception:
-        return None
-
-
-def _trading_days_until_next_earnings(ticker: str, ref_date) -> Optional[int]:
-    """다음 실적 발표일까지 남은 거래일 수. 없으면 None."""
-    next_earnings = _next_earnings_date(ticker, ref_date)
-    if next_earnings is None:
-        return None
-    return _trading_days_between(ref_date, next_earnings)
-
-
-def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold_days=None, skip_earnings_warning=False, skip_holding_days_warning=False, apply_near_expiry=True):
+def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold_days=None, skip_earnings_warning=False, skip_holding_days_warning=False):
     """
     보유 포지션 매도/익절 후보 룰(스윙용):
     - TAKE_PROFIT: 종가가 60D High 근접/도달 시 (익절 고려)
@@ -1221,11 +984,9 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
       trailing_stop = max(SMA20, close - 2ATR)
     - SELL_TREND: 추세 꺾임 확인(보수적) — 2일 연속 종가<SMA20 또는 종가<SMA50 + 컨펌
     - SELL_STRUCTURE_BREAK: 구조 붕괴(최근 N봉 스윙 로우 아래로 종가 이탈)
-    - SELL_LOSS_CUT: 진입가 대비 N% 손실 시 손절(3번)
-    - 그 외: HOLD. 반환에 SuggestedSellPct/SuggestedSellReason(1번 스케일아웃) 포함.
+    - 그 외: HOLD
     - skip_earnings_warning=True: 실적일 yfinance 조회 생략(백테스트 등 속도용)
     - skip_holding_days_warning=True: 보유기간 경고 블록 생략(백테스트용)
-    - apply_near_expiry=False: 만료 근접 시 트레일 강화/컨펌 완화(2번) 미적용. 포트폴리오용.
     """
     last = df2.iloc[-1]
     prev = df2.iloc[-2] if len(df2) >= 2 else last
@@ -1421,31 +1182,11 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
             tags.append("2D_CONFIRM")
         return ",".join(tags) if tags else "NO_CONFIRM"
 
-    # 2번: 만료 근접 시 트레일 강화(ATR 배수 축소) + 컨펌 완화용 플래그 (apply_near_expiry=False면 미적용)
-    _max_hold = int(max_hold_days) if max_hold_days is not None else int(getattr(cfg, "MAX_HOLD_DAYS_DEFAULT", 15))
-    tighten_before = int(getattr(cfg, "HOLDING_DAYS_TIGHTEN_BEFORE", 2))
-    near_expiry = bool(apply_near_expiry) and (days_held is not None and int(days_held) >= _max_hold - tighten_before)
-    # 4번: ATR 확대 시 배수 완화(2.5), 축소 시 강화(1.5). 만료 근접이면 1.5 우선.
-    atr_mult_base = 2.0
-    if not near_expiry and np.isfinite(atr14) and "ATR14" in df2.columns and len(df2) >= 12:
-        lb = int(getattr(cfg, "ATR_TRAIL_LOOKBACK", 10))
-        atr_avg = float(df2["ATR14"].iloc[-(lb + 1):-1].mean())
-        if atr_avg > 0:
-            exp_ratio = float(getattr(cfg, "ATR_TRAIL_EXPAND_RATIO", 1.2))
-            sq_ratio = float(getattr(cfg, "ATR_TRAIL_SQUEEZE_RATIO", 0.8))
-            if atr14 >= atr_avg * exp_ratio:
-                atr_mult_base = float(getattr(cfg, "ATR_TRAIL_MULT_EXPANDED", 2.5))
-            elif atr14 <= atr_avg * sq_ratio:
-                atr_mult_base = float(getattr(cfg, "ATR_TRAIL_MULT_SQUEEZED", 1.5))
-    atr_mult_trail = float(getattr(cfg, "TRAIL_ATR_MULT_NEAR_EXPIRY", 1.5)) if near_expiry else atr_mult_base
 
-    # 5번: 강한 매도(음봉 + 거래량 확대) 시 컨펌 없이 SELL 허용
-    strong_sell_confirm = bool(getattr(cfg, "SELL_STRONG_VOL_DOWN_SKIP_CONFIRM", True)) and vol_confirm
-
-    # trailing stop (만료 근접 또는 4번 시 atr_mult_trail 사용)
+    # trailing stop
     if np.isfinite(atr14) and np.isfinite(sma20):
         buf = float(getattr(cfg, "SELL_TRAIL_ATR_BUFFER", 0.0))
-        trailing = max(sma20, close - (atr_mult_trail + buf) * atr14)
+        trailing = max(sma20, close - (2.0 + buf) * atr14)
     elif np.isfinite(sma20):
         trailing = sma20
     else:
@@ -1454,15 +1195,6 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
     # PnL
     pnl = (close - float(avg_price)) * float(shares)
     pnl_pct = (close / float(avg_price) - 1) * 100 if float(avg_price) > 0 else np.nan
-
-    # 1차·2차·3차 손절가 (정교하게): 1차=트레일, 2차=진입가 -5%, 3차=진입가 -10%. 항상 1차 >= 2차 >= 3차.
-    stop_2nd_pct = float(getattr(cfg, "SELL_2ND_CUT_PCT", 5.0))
-    loss_cut_pct = float(getattr(cfg, "SELL_LOSS_CUT_PCT", 10.0))
-    stop_3_price = float(avg_price) * (1 - loss_cut_pct / 100.0) if float(avg_price) > 0 else np.nan
-    stop_2_price = float(avg_price) * (1 - stop_2nd_pct / 100.0) if float(avg_price) > 0 else np.nan
-    if np.isfinite(stop_2_price) and np.isfinite(stop_3_price) and stop_2_price < stop_3_price:
-        stop_2_price = stop_3_price
-    stop_1_price = max(trailing, stop_2_price) if (np.isfinite(trailing) and np.isfinite(stop_2_price)) else (trailing if np.isfinite(trailing) else stop_2_price)
 
     # 목표가(익절 후보): 최근 60일 고가(High60) 근접/도달
     high60 = float(df2["High"].tail(60).max()) if "High" in df2.columns and len(df2) >= 60 else np.nan
@@ -1495,33 +1227,20 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
     action = "HOLD"
     reason = f"Trail {trailing:.2f} | SMA20 {sma20:.2f} | SMA50 {sma50:.2f}"
 
-    # 3번: 수익/손실 비대칭 (loss_cut_pct는 위 손절가 블록에서 이미 로드됨)
-    in_profit = (pnl_pct is not None and np.isfinite(pnl_pct) and pnl_pct >= 0)
-    loss_cut = (pnl_pct is not None and np.isfinite(pnl_pct) and pnl_pct <= -loss_cut_pct)
-    skip_confirm_when_loss = bool(getattr(cfg, "SELL_SKIP_CONFIRM_WHEN_LOSS", True))
-
-    # 우선순위: 0) 손절  1) 트레일 이탈  2) 추세 이탈(SMA)  3) 구조 붕괴  4) 익절
-    # 2번: 만료 근접 시 컨펌 없이 SELL. 5번: 강한 매도 시 컨펌 없이 SELL. 3번: 손실 시 컨펌 생략 가능.
-    sell_ok = _sell_confirm_ok() or near_expiry or strong_sell_confirm or (not in_profit and skip_confirm_when_loss)
-
-    if loss_cut:
-        action = "SELL_LOSS_CUT"
-        reason = f"손절(진입가 대비 {pnl_pct:.1f}% 손실, 기준 -{loss_cut_pct}%) | {reason}"
-    elif below_trailing:
-        if sell_ok:
+    # 우선순위: 1) 트레일 이탈  2) 추세 이탈(SMA)  3) 구조 붕괴(스윙 로우)  4) 익절
+    if below_trailing:
+        if _sell_confirm_ok():
             action = "SELL_TRAIL"
-            tag = "만료근접" if near_expiry else ("강한매도(음봉+거래량)" if strong_sell_confirm else _sell_confirm_tag())
-            reason = f"TrailingStop 하회({tag}) → 추세 이탈 | {reason}"
+            reason = f"TrailingStop 하회(컨펌:{_sell_confirm_tag()}) → 추세 이탈 | {reason}"
         else:
             action = "HOLD"
             reason = f"TrailingStop 하회(컨펌부족:{_sell_confirm_tag()}) → HOLD | {reason}"
 
     elif below_sma50 or two_days_below_sma20:
         why = "종가<SMA50" if below_sma50 else "2일 연속 SMA20 아래 마감"
-        if sell_ok:
+        if _sell_confirm_ok():
             action = "SELL_TREND"
-            tag = "만료근접" if near_expiry else ("강한매도(음봉+거래량)" if strong_sell_confirm else _sell_confirm_tag())
-            reason = f"{why}({tag}) → 추세 꺾임 확인 | {reason}"
+            reason = f"{why}(컨펌:{_sell_confirm_tag()}) → 추세 꺾임 확인 | {reason}"
         else:
             action = "HOLD"
             reason = f"{why}(컨펌부족:{_sell_confirm_tag()}) → HOLD | {reason}"
@@ -1537,29 +1256,6 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
         else:
             action = "HOLD"
             reason = f"High60 근접(컨펌부족:{_tp_confirm_tag()}) → HOLD | {reason}"
-
-    # 1번: 단계적 청산 — 권장 청산 비율/사유 (T1/T2/T3 구간 구분)
-    suggested_sell_pct = 0.0
-    suggested_sell_reason = ""
-    try:
-        t1, t2, t3 = _compute_tp_levels(df2, boost=False)
-        pct_t1 = float(getattr(cfg, "TP_SCALE_OUT_PCT_T1", 0.33))
-        pct_t2 = float(getattr(cfg, "TP_SCALE_OUT_PCT_T2", 0.33))
-        if action == "TAKE_PROFIT" and np.isfinite(t3) and np.isfinite(t2) and np.isfinite(t1):
-            if close >= t3 * 0.998:
-                suggested_sell_pct = float(getattr(cfg, "TP_SCALE_OUT_PCT_T3", 1.0))
-                suggested_sell_reason = "T3"
-            elif close >= t2 * 0.998:
-                suggested_sell_pct = pct_t2
-                suggested_sell_reason = "T2"
-            elif close >= t1 * 0.998:
-                suggested_sell_pct = pct_t1
-                suggested_sell_reason = "T1"
-        elif action in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT"):
-            suggested_sell_pct = 1.0
-            suggested_sell_reason = action
-    except Exception:
-        pass
 
     # 분배(Distribution) 경고: 참고용. 하락일+거래량확대가 최근 N일 중 M일 이상이면 Reason에 추가
     distribution_warning = False
@@ -1647,15 +1343,62 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
     if not skip_earnings_warning:
         try:
             last_dt = df2.index[-1]
-            ref_date = last_dt.date() if hasattr(last_dt, "date") else (pd.Timestamp(last_dt).date() if hasattr(pd, "Timestamp") else datetime.now(timezone.utc).date())
+            ref_date = last_dt.date() if hasattr(last_dt, "date") else (pd.Timestamp(last_dt).date() if hasattr(pd, "Timestamp") else datetime.utcnow().date())
         except Exception:
-            ref_date = datetime.now(timezone.utc).date()
+            ref_date = datetime.utcnow().date()
         warn_days = int(getattr(cfg, "EARNINGS_WARNING_DAYS", 10))
         try:
-            days_ahead = _days_until_next_earnings(ticker, ref_date)
-            if days_ahead is not None and 0 <= days_ahead <= warn_days:
-                earnings_warning = True
-                earnings_warning_reason = f"⚠ 실적 발표 {days_ahead}일 전"
+            t = yf.Ticker(ticker)
+            future_dates = []
+            if hasattr(t, "get_earnings_dates"):
+                ed_df = t.get_earnings_dates(limit=8)
+                if ed_df is not None and not ed_df.empty and hasattr(ed_df.index, "tolist"):
+                    for d in ed_df.index.tolist():
+                        try:
+                            earn_d = pd.Timestamp(d).date()
+                            if earn_d >= ref_date:
+                                future_dates.append(earn_d)
+                        except Exception:
+                            continue
+            if not future_dates and hasattr(t, "calendar"):
+                cal = t.calendar
+                if isinstance(cal, dict) and "Earnings Date" in cal:
+                    ed = cal["Earnings Date"]
+                    if isinstance(ed, (list, tuple)) and len(ed) > 0:
+                        for x in ed:
+                            try:
+                                d = pd.Timestamp(x).date()
+                                if d >= ref_date:
+                                    future_dates.append(d)
+                            except Exception:
+                                continue
+                    elif ed is not None:
+                        try:
+                            d = pd.Timestamp(ed).date()
+                            if d >= ref_date:
+                                future_dates.append(d)
+                        except Exception:
+                            pass
+            if not future_dates and hasattr(t, "info"):
+                info = t.info or {}
+                for key in ("earningsDate", "nextEarningsDate"):
+                    ed = info.get(key)
+                    if ed is not None:
+                        try:
+                            if isinstance(ed, (list, tuple)) and len(ed) > 0:
+                                ed = ed[0]
+                            d = pd.Timestamp(ed).date()
+                            if d >= ref_date:
+                                future_dates.append(d)
+                            break
+                        except Exception:
+                            continue
+            next_earnings = min(future_dates) if future_dates else None
+            if next_earnings is not None:
+                delta = (next_earnings - ref_date).days
+                if 0 <= delta <= warn_days:
+                    earnings_warning = True
+                    earnings_warning_reason = f"⚠ 실적 발표 {delta}일 전"
         except Exception:
             pass
     if earnings_warning:
@@ -1668,16 +1411,10 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
         "SMA20": round(sma20, 2) if np.isfinite(sma20) else None,
         "SMA50": round(sma50, 2) if np.isfinite(sma50) else None,
         "TrailingStop": round(trailing, 2) if np.isfinite(trailing) else None,
-        "Stop1Price": round(stop_1_price, 2) if np.isfinite(stop_1_price) else None,
-        "Stop2Price": round(stop_2_price, 2) if np.isfinite(stop_2_price) else None,
-        "Stop3Price": round(stop_3_price, 2) if np.isfinite(stop_3_price) else None,
-        "SwingLow": round(swing_low_val, 2) if np.isfinite(swing_low_val) else None,
         "High60": round(high60, 2) if np.isfinite(high60) else None,
         "PnL": round(pnl, 2),
         "PnL%": round(pnl_pct, 2) if np.isfinite(pnl_pct) else None,
         "Reason": reason,
-        "SuggestedSellPct": round(suggested_sell_pct, 2),
-        "SuggestedSellReason": suggested_sell_reason,
         "DistributionWarning": distribution_warning,
         "DistributionReason": distribution_reason or None,
         "TrendWeaknessWarning": trend_weakness_warning,
@@ -1696,19 +1433,15 @@ def holding_risk_review(df2, ticker, shares, avg_price, days_held=None, max_hold
 def backtest_signal_dates(df2: pd.DataFrame, ticker: str):
     """
     과거 각 일자에 대해 decide_entry / holding_risk_review를 적용해
-    매수 신호 날짜·매도 신호 날짜·매도 시 진입가·매수 근거·매도 근거를 반환.
+    매수 신호 날짜·매도 신호 날짜·매도 시 진입가를 반환.
     - buy_dates, sell_dates: 해당 날짜 인덱스(타임스탬프) 리스트.
     - sell_entry_prices: sell_dates와 동일 순서로, 각 매도에 대응하는 진입가 리스트.
-    - buy_reasons: buy_dates와 동일 순서로, 각 매수 신호 근거(진입 타입/트리거) 문자열.
-    - sell_reasons: sell_dates와 동일 순서로, 각 매도 신호 근거(Reason 또는 Action) 문자열.
     """
     if df2 is None or len(df2) < 260:
-        return [], [], [], [], []
+        return [], [], []
     buy_dates = []
     sell_dates = []
     sell_entry_prices = []
-    buy_reasons = []
-    sell_reasons = []
     max_hold = int(getattr(cfg, "MAX_HOLD_DAYS_DEFAULT", 15))
     start_i = 200  # SMA200 등 지표 유효 구간
     in_position = False
@@ -1728,10 +1461,9 @@ def backtest_signal_dates(df2: pd.DataFrame, ticker: str):
 
         if not in_position:
             try:
-                entry, trigger, entry_hint, invalid, note = decide_entry(df_slice)
+                entry, *_ = decide_entry(df_slice)
                 if str(entry).startswith("BUY_"):
                     buy_dates.append(df2.index[i])
-                    buy_reasons.append(trigger or str(entry))
                     entry_price = float(df_slice.iloc[-1]["Close"])
                     entry_date = cur_date
                     in_position = True
@@ -1752,17 +1484,16 @@ def backtest_signal_dates(df2: pd.DataFrame, ticker: str):
                 skip_holding_days_warning=True,
             )
             action = risk.get("Action", "HOLD")
-            if action in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT", "TAKE_PROFIT"):
+            if action in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "TAKE_PROFIT"):
                 sell_dates.append(df2.index[i])
                 sell_entry_prices.append(entry_price)
-                sell_reasons.append(risk.get("Reason") or action)
                 in_position = False
                 entry_price = None
                 entry_date = None
         except Exception:
             pass
 
-    return buy_dates, sell_dates, sell_entry_prices, buy_reasons, sell_reasons
+    return buy_dates, sell_dates, sell_entry_prices
 
 
 def _round_up_to_step(x: float, step: float) -> float:
@@ -1782,69 +1513,100 @@ def _tp_step_by_price(price: float) -> float:
         return 5
     return 1
 
-def _compute_tp_levels(df2: pd.DataFrame, boost: bool = False):
-    """ATR 기반 목표가 t1, t2, t3 반환. 실패 시 (np.nan, np.nan, np.nan)."""
-    if df2 is None or df2.empty:
-        return np.nan, np.nan, np.nan
-    try:
-        last = df2.iloc[-1]
-        close = float(last["Close"]) if "Close" in last else np.nan
-        atr14 = float(last["ATR14"]) if "ATR14" in last else np.nan
-        if not (np.isfinite(close) and close > 0 and np.isfinite(atr14) and atr14 > 0):
-            return np.nan, np.nan, np.nan
-        step = _tp_step_by_price(close)
-        base_m1 = float(getattr(cfg, "TP_ATR_M1", 1.0))
-        base_m2 = float(getattr(cfg, "TP_ATR_M2", 2.0))
-        base_m3 = float(getattr(cfg, "TP_ATR_M3", 3.0))
-        boost_m1 = float(getattr(cfg, "TP_ATR_BOOST_M1", 1.3))
-        boost_m2 = float(getattr(cfg, "TP_ATR_BOOST_M2", 2.6))
-        boost_m3 = float(getattr(cfg, "TP_ATR_BOOST_M3", 4.0))
-        m1, m2, m3 = (boost_m1, boost_m2, boost_m3) if boost else (base_m1, base_m2, base_m3)
-        t1_raw = close + atr14 * m1
-        t2_raw = close + atr14 * m2
-        t3_raw = close + atr14 * m3
-        t1 = _round_up_to_step(t1_raw, step)
-        t2 = _round_up_to_step(t2_raw, step)
-        t3 = _round_up_to_step(t3_raw, step)
-        use_cap = bool(getattr(cfg, "TP_USE_HIGH60_CAP", True))
-        high60 = float(df2["High"].tail(60).max()) if "High" in df2.columns and len(df2) >= 60 else np.nan
-        floor_m2 = float(getattr(cfg, "TP_FLOOR_ATR_M2", 3.0))
-        floor_m3 = float(getattr(cfg, "TP_FLOOR_ATR_M3", 4.5))
-        t2_floor = close + atr14 * floor_m2
-        t3_floor = close + atr14 * floor_m3
-        cap2_mult = float(getattr(cfg, "TP_CAP_H60_MULT_2", 1.02))
-        cap3_mult = float(getattr(cfg, "TP_CAP_H60_MULT_3", 1.05))
-        if use_cap and np.isfinite(high60) and high60 > 0:
-            if bool(getattr(cfg, "TP_CAP_DISABLE_ON_BREAKOUT", True)):
-                buf = float(getattr(cfg, "TP_CAP_DISABLE_BUFFER", 0.002))
-                if close >= high60 * (1 + buf):
-                    use_cap = False
-            if use_cap:
-                t2_raw = min(t2_raw, high60 * cap2_mult)
-                t3_raw = min(t3_raw, high60 * cap3_mult)
-        t2_raw = max(t2_raw, t2_floor)
-        t3_raw = max(t3_raw, t3_floor)
-        t2 = _round_up_to_step(t2_raw, step)
-        t3 = _round_up_to_step(t3_raw, step)
-        if t2 <= t1:
-            t2 = t1 + step
-        if t3 <= t2:
-            t3 = t2 + step
-        return float(t1), float(t2), float(t3)
-    except Exception:
-        return np.nan, np.nan, np.nan
-
-
 def build_partial_tp_plan(df2: pd.DataFrame, boost: bool = False) -> str:
     """
     ATR 기반 동적 부분익절 플랜:
     - HOLD: 기본 ATR 배수
     - boost=True(ADD_BUY): 목표가 배수 상향
     """
-    t1, t2, t3 = _compute_tp_levels(df2, boost)
-    if not (np.isfinite(t1) and np.isfinite(t2) and np.isfinite(t3)):
+    if df2 is None or df2.empty:
         return ""
-    tag = "목표가(상향, ATR)" if boost else "목표가(ATR)"
+
+    last = df2.iloc[-1]
+    close = float(last["Close"]) if "Close" in last else np.nan
+    atr14 = float(last["ATR14"]) if "ATR14" in last else np.nan
+
+    if not (np.isfinite(close) and close > 0 and np.isfinite(atr14) and atr14 > 0):
+        return ""
+
+    step = _tp_step_by_price(close)
+
+    # ✅ 설정값이 있으면 우선 사용 (없으면 기본값)
+    base_m1 = float(getattr(cfg, "TP_ATR_M1", 1.0))
+    base_m2 = float(getattr(cfg, "TP_ATR_M2", 2.0))
+    base_m3 = float(getattr(cfg, "TP_ATR_M3", 3.0))
+
+    boost_m1 = float(getattr(cfg, "TP_ATR_BOOST_M1", 1.3))
+    boost_m2 = float(getattr(cfg, "TP_ATR_BOOST_M2", 2.6))
+    boost_m3 = float(getattr(cfg, "TP_ATR_BOOST_M3", 4.0))
+
+    if boost:
+        m1, m2, m3 = boost_m1, boost_m2, boost_m3
+        tag = "목표가(상향, ATR)"
+    else:
+        m1, m2, m3 = base_m1, base_m2, base_m3
+        tag = "목표가(ATR)"
+
+    # ✅ ATR 기반 목표가
+    t1_raw = close + atr14 * m1
+    t2_raw = close + atr14 * m2
+    t3_raw = close + atr14 * m3
+
+    t1 = _round_up_to_step(t1_raw, step)
+    t2 = _round_up_to_step(t2_raw, step)
+    t3 = _round_up_to_step(t3_raw, step)
+    
+        # =========================
+    # ✅ High60 캡(현실화) + ATR 바닥(최소 보장)
+    # =========================
+    use_cap = bool(getattr(cfg, "TP_USE_HIGH60_CAP", True))
+
+    # 최근 60일 고점(High60)
+    high60 = np.nan
+    try:
+        if "High" in df2.columns and len(df2) >= 60:
+            high60 = float(df2["High"].tail(60).max())
+    except Exception:
+        high60 = np.nan
+
+    # 2차/3차 최소 바닥(ATR 기반 최소 보장)
+    floor_m2 = float(getattr(cfg, "TP_FLOOR_ATR_M2", 3.0))
+    floor_m3 = float(getattr(cfg, "TP_FLOOR_ATR_M3", 4.5))
+    t2_floor = close + atr14 * floor_m2
+    t3_floor = close + atr14 * floor_m3
+
+    # 2차/3차 High60 상한 캡
+    cap2_mult = float(getattr(cfg, "TP_CAP_H60_MULT_2", 1.02))
+    cap3_mult = float(getattr(cfg, "TP_CAP_H60_MULT_3", 1.05))
+
+    if use_cap and np.isfinite(high60) and high60 > 0:
+
+        # ✅ High60 돌파(종가 확인) 이후에는 캡 자동 해제
+        if bool(getattr(cfg, "TP_CAP_DISABLE_ON_BREAKOUT", True)):
+            buf = float(getattr(cfg, "TP_CAP_DISABLE_BUFFER", 0.002))
+            if close >= high60 * (1 + buf):
+                use_cap = False
+
+        # 캡이 유지되는 경우에만 적용
+        if use_cap:
+            cap2 = high60 * cap2_mult
+            cap3 = high60 * cap3_mult
+
+            t2_raw = min(t2_raw, cap2)
+            t3_raw = min(t3_raw, cap3)
+
+
+    # 바닥 보정(캡 때문에 과도하게 낮아지는 경우 방지)
+    t2_raw = max(t2_raw, t2_floor)
+    t3_raw = max(t3_raw, t3_floor)
+
+
+    # 단조 증가 보장(라운딩 때문에 같아질 수 있어 방어)
+    if t2 <= t1:
+        t2 = t1 + step
+    if t3 <= t2:
+        t3 = t2 + step
+
     return (f"{tag}: 1차 {t1:.0f} 1/3익절, "
             f"2차 {t2:.0f} 1/2 익절, "
             f"3차 {t3:.0f} 전량 익절")
@@ -1916,10 +1678,10 @@ def recommend_for_holding(df2, ticker, shares, avg_price):
             plan = None
 
     # 3) 최종 추천(우선순위: 방어매도 > 익절 > 추가매수 > 보유)
-    if risk["Action"] in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT"):
+    if risk["Action"] in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK"):
         return {
             "Ticker": ticker,
-            "Reco": "SELL(손절)" if risk["Action"] == "SELL_LOSS_CUT" else "SELL",
+            "Reco": "SELL",
             "SellSignal": risk["Action"],
             "AddSignal": entry,
             "Close": risk["Close"],
@@ -1985,7 +1747,7 @@ def analyze_single_ticker(ticker: str, shares: float = 0.0, avg_price: float = 0
     global MARKET_STATE  # ✅ 반드시 첫 줄 (SyntaxError 방지)
 
     ticker = ticker.upper().strip()
-    end = datetime.now(timezone.utc).date()
+    end = datetime.utcnow().date()
     start = end - timedelta(days=cfg.LOOKBACK_DAYS)
 
     # -------------------------
@@ -2017,7 +1779,7 @@ def analyze_single_ticker(ticker: str, shares: float = 0.0, avg_price: float = 0
     regime_data = None
     try:
         regime_data = yf.download(
-            ["SPY", "QQQ", "IWM", "^VIX", "XLP"],
+            ["SPY"],
             start=str(start),
             end=str(end + timedelta(days=1)),
             interval="1d",
@@ -2160,7 +1922,7 @@ def analyze_single_ticker(ticker: str, shares: float = 0.0, avg_price: float = 0
     # -------------------------
     # 최종 추천 결정
     # -------------------------
-    if risk["Action"] in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT"):
+    if risk["Action"] in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK"):
         reco = "SELL"
         why = risk.get("Reason", "")
 
@@ -2242,7 +2004,7 @@ def query_loop():
         # error 키도 대/소문자 혼재 방어
         err = res.get("Error", res.get("error", None))
         if err:
-            print(f"[X] {Ticker} - {err}\n")
+            print(f"❌ {Ticker} - {err}\n")
             continue
 
         print(f"\n[{Ticker}]  ✅ RECO: {Reco}")
@@ -2286,14 +2048,14 @@ def portfolio_edit_loop(path="positions.csv"):
                 continue
             parts = [p.strip() for p in line.split(",")]
             if len(parts) != 3:
-                print("[X] 형식 오류. 예: AAPL,10,190.2\n")
+                print("❌ 형식 오류. 예: AAPL,10,190.2\n")
                 continue
             t, sh, ap = parts
             try:
                 add_or_update_position(t, float(sh), float(ap), path=path, mode="merge")
                 print(f"✅ 추가/업데이트 완료: {t.upper()} (merge)\n")
             except Exception as e:
-                print(f"[X] 실패: {e}\n")
+                print(f"❌ 실패: {e}\n")
             continue
 
         if cmd == "del":
@@ -2317,7 +2079,7 @@ def portfolio_edit_loop(path="positions.csv"):
                 if 0 <= idx < len(tickers):
                     t = tickers[idx]
                 else:
-                    print("[X] 잘못된 번호입니다.\n")
+                    print("❌ 잘못된 번호입니다.\n")
                     continue
 
             try:
@@ -2327,10 +2089,10 @@ def portfolio_edit_loop(path="positions.csv"):
                 else:
                     print(f"⚠️ 해당 티커 없음: {t}\n")
             except Exception as e:
-                print(f"[X] 실패: {e}\n")
+                print(f"❌ 실패: {e}\n")
             continue
 
-        print("[X] 알 수 없는 명령입니다. add/del/list/back 중 선택하세요.\n")
+        print("❌ 알 수 없는 명령입니다. add/del/list/back 중 선택하세요.\n")
 
 
 
@@ -2395,7 +2157,7 @@ def score_stock(df, ticker, market_state=None, data=None):
     if df is None or df.empty:
         return None
      # ✅ 데이터 품질 체크(신뢰도)
-    end_date = datetime.now(timezone.utc).date()
+    end_date = datetime.utcnow().date()
     ok, q_reason = data_quality_check(df, end_date, max_stale_days=getattr(cfg, "MAX_DATA_STALE_DAYS", 5))
     
     if not ok:
@@ -2516,18 +2278,21 @@ def score_stock(df, ticker, market_state=None, data=None):
             entry = "SKIP"
             note = "MACD 확인(상향크로스/0선돌파) 미충족 → 매수 금지"
 
-    # ===== 시장 레짐 정보(참고용, 선정에는 미적용) =====
+    # ===== 시장 레짐 필터 =====
     entry_raw = entry
-    ms = market_state or MARKET_STATE
+    ms = market_state or MARKET_STATE  # ✅ 주입값 우선, 없으면 기존 전역 fallback
     regime = ms.get("regime", "UNKNOWN")
     spy50 = ms.get("spy_sma50")
     spy200 = ms.get("spy_sma200")
+
     if str(entry).startswith("BUY_"):
         if regime == "RISK_OFF":
-            note = (str(note) + f" | MARKET RISK_OFF(참고): SPY<SMA50&SMA200 ({spy50}/{spy200})").strip(" |")
+            entry = "SKIP"
+            note = (str(note) + f" | 🧯 MARKET RISK_OFF: SPY<SMA50&SMA200 ({spy50}/{spy200})").strip(" |")
         elif regime == "CAUTION":
             if entry == "BUY_BREAKOUT":
-                note = (str(note) + f" | MARKET CAUTION(참고): SPY<SMA200 ({spy200})").strip(" |")
+                entry = "WATCH_BREAKOUT"
+                note = (str(note) + f" | ⚠️ MARKET CAUTION: SPY<SMA200 ({spy200})").strip(" |")
 
     # ✅ ADX(추세 강도) 필터: 추세 없으면 BUY → WATCH_ADX
     min_adx = float(getattr(cfg, "MIN_ADX", 20))
@@ -2631,18 +2396,15 @@ def score_stock(df, ticker, market_state=None, data=None):
     except Exception:
         prob, ev = None, None
 
-    # 1) 고정 순서: Ticker, Sector, Entry, EntryRaw, Close, MktCap  →  2) MktCap 뒤부터 중요도 순
     return {
         "Ticker": ticker,
         "Sector": sector,
         "Entry": entry,
         "EntryRaw": entry_raw,
+        "Score": round(score, 1),
         "Close": round(last_close, 2),
         "MktCap_KRW_T": round(mktcap_krw / 1e12, 1) if mktcap_krw else None,
-        "EV": round(ev, 2) if ev is not None else None,
-        "Prob": round(prob, 2) if prob is not None else None,
-        "RR": plan["RR"] if plan else None,
-        "Score": round(score, 1),
+        "Avg$Vol": int(dollar_vol_20),
         "VolRatio": round(vol_ratio, 2),
         "RSI": round(rsi_now, 1) if np.isfinite(rsi_now) else None,
         "ATR%": round(atr_pct, 2) if np.isfinite(atr_pct) else None,
@@ -2658,9 +2420,12 @@ def score_stock(df, ticker, market_state=None, data=None):
         "EntryPrice": plan["EntryPrice"] if plan else None,
         "StopPrice": plan["StopPrice"] if plan else None,
         "TargetPrice": plan["TargetPrice"] if plan else None,
+        "RR": plan["RR"] if plan else None,
+        "EV": round(ev, 2) if ev is not None else None,
+        "Prob": round(prob, 2) if prob is not None else None,
         "Shares": plan["Shares"] if plan else None,
         "PosValue": plan["PosValue"] if plan else None,
-        "Avg$Vol": int(dollar_vol_20),
+        
     }
 # =========================
 # 시장 상태(레짐) 필터용 전역
@@ -2682,7 +2447,7 @@ COLOR_RISK = 0xE74C3C    # red
 def discord_webhook_send(embeds, content=None):
     url = cfg.DISCORD_WEBHOOK_URL.strip()
     if not url.startswith("https://discord.com/api/webhooks"):
-        print("[X] DISCORD_WEBHOOK_URL 설정 필요")
+        print("❌ DISCORD_WEBHOOK_URL 설정 필요")
         return False
 
     payload = {"embeds": embeds}
@@ -2818,9 +2583,14 @@ def embed_for_market(run_date):
     else:
         emoji = "⚪"
 
+    risk_dollar = cfg.ACCOUNT_EQUITY_USD * cfg.RISK_PER_TRADE
+    total_risk = risk_dollar * cfg.MAX_BUY_PER_DAY
+
     desc = (
         f"**Regime:** {emoji} {reg}\n"
-        f"SPY SMA50: {s50} | SMA200: {s200}"
+        f"SPY SMA50: {s50} | SMA200: {s200}\n\n"
+        f"계좌: **${cfg.ACCOUNT_EQUITY_USD:,}**\n"
+        f"1R: **${risk_dollar:,.0f}** | Max Risk Today: **${total_risk:,.0f}**"
     )
 
     return {
@@ -2966,9 +2736,16 @@ def ev_rank_top_picks(buy_df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
         return 0.0
     macd_b = d["MACDTrigger"].apply(_macd_bonus)
 
-    # 레짐 보정 — 종목 선정/순위에는 미적용 (0 고정)
+    # 레짐 보정(전역 MARKET_STATE 사용)
     reg = str(MARKET_STATE.get("regime", "UNKNOWN"))
-    regime_b = 0.0
+    if reg == "RISK_ON":
+        regime_b = 0.08
+    elif reg == "CAUTION":
+        regime_b = -0.05
+    elif reg == "RISK_OFF":
+        regime_b = -0.15
+    else:
+        regime_b = 0.0
 
     # BUY_SMART는 확률 약간 페널티(승격이므로)
     def _smart_penalty(e):
@@ -3109,8 +2886,15 @@ def calc_prob_ev_like_discord(row: dict, market_state: dict | None = None):
     # MACD 보너스
     macd_b = 0.10 if macdtr == "CROSS_UP" else (0.07 if macdtr == "HIST_0_UP" else 0.0)
 
-    # 레짐 보정 — 미적용 (0 고정)
-    regime_b = 0.0
+    # 레짐 보정
+    if reg == "RISK_ON":
+        regime_b = 0.08
+    elif reg == "CAUTION":
+        regime_b = -0.05
+    elif reg == "RISK_OFF":
+        regime_b = -0.15
+    else:
+        regime_b = 0.0
 
     # BUY_SMART 페널티
     smart_p = -0.08 if entry == "BUY_SMART" else 0.0
@@ -3330,7 +3114,7 @@ def embed_for_buy(buy_df, run_date):
         desc = "\n\n".join(lines)
 
     return {
-        "title": f"🟢 BUY (max {int(cfg.MAX_BUY_PER_DAY)}) — {run_date}",
+        "title": f"🟢 BUY (max {cfg.MAX_BUY_PER_DAY}) — {run_date}",
         "description": desc[:3900],
         "color": COLOR_BUY
     }
@@ -3389,15 +3173,9 @@ def main():
     # ✅ 안전 초기화 (먼저 선언부터)
     run_date = ""
     skip_reasons = []  # (ticker, reason)
-    end = datetime.now(timezone.utc).date()
+    end = datetime.utcnow().date()
     start = end - timedelta(days=cfg.LOOKBACK_DAYS)
     run_date = str(end)
-
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    SNAPSHOTS_DIR = os.path.join(BASE_DIR, "snapshots")
-    SCAN_CSV_DIR = os.path.join(BASE_DIR, "scan_csv")
-    os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
-    os.makedirs(SCAN_CSV_DIR, exist_ok=True)
 
     results = []
 
@@ -3408,7 +3186,7 @@ def main():
         pos_tickers = pos["Ticker"].astype(str).str.upper().tolist()
 
     # ✅ 전체 티커(스캔 + 보유 + 시장지수)
-    bench = ["SPY", "QQQ", "IWM", "^VIX", "XLP"]
+    bench = ["SPY", "QQQ"]
     scan_universe = [t.upper() for t in TICKERS if t.upper() not in TICKER_BLACKLIST]
     all_tickers = sorted(list(set(scan_universe + pos_tickers + bench)))
 
@@ -3432,10 +3210,9 @@ def main():
     MARKET_STATE = compute_market_state_from_data(data)
 
     reg = MARKET_STATE.get("regime")
-    score = MARKET_STATE.get("score")
     s50 = MARKET_STATE.get("spy_sma50")
     s200 = MARKET_STATE.get("spy_sma200")
-    print(f"[MARKET] regime={reg} | score={score}/100 | SPY SMA50={s50} SMA200={s200}")
+    print(f"[MARKET] SPY regime={reg} | SMA50={s50} | SMA200={s200}")
 
 
     # ✅ 스캔 결과
@@ -3461,7 +3238,7 @@ def main():
             df = _drop_today_bar_if_needed(df)
             
             # ✅ SKIP 사유 수집(데이터 품질/기본 요건)
-            end_date = datetime.now(timezone.utc).date()
+            end_date = datetime.utcnow().date()
             ok, q_reason = data_quality_check(df, end_date, max_stale_days=getattr(cfg, "MAX_DATA_STALE_DAYS", 5))
             if not ok:
                 skip_reasons.append((t, f"DATA_QUALITY: {q_reason}"))
@@ -3495,11 +3272,23 @@ def main():
         return
 
     # -----------------------------
-    # 시가총액 가산점 없음 (50~100조 로직 제거)
+    # ✅ 50~100조는 '필터'가 아니라 '선호(가산점)'로 반영
     # -----------------------------
+    df_all["MktPref"] = 0
+    if "MktCap_KRW_T" in df_all.columns:
+        df_all["MktPref"] = df_all["MktCap_KRW_T"].apply(
+            lambda x: 1 if (pd.notna(x) and 50 <= float(x) <= 100) else 0
+        )
+        df_all.loc[df_all["MktPref"] == 1, "Score"] = df_all.loc[df_all["MktPref"] == 1, "Score"] + 8
+
+        def _tag_note(row):
+            if row.get("MktPref", 0) == 1:
+                return (str(row.get("Note", "")) + " | ✅ 50~100조 선호").strip(" |")
+            return row.get("Note", "")
+        df_all["Note"] = df_all.apply(_tag_note, axis=1)
 
     # -----------------------------
-    # 정렬: BUY/WATCH 우선순위 + Score + 유동성
+    # 정렬: BUY/WATCH 우선순위 + (선호 시총 가산된) Score + 유동성
     # -----------------------------
     priority = {
         "BUY_BREAKOUT": 0,
@@ -3517,7 +3306,7 @@ def main():
     }
 
     df_all["P"] = df_all["Entry"].map(priority).fillna(9).astype(int)
-    df_all["RR_sort"] = df_all["RR"].fillna(-1.0).astype(float)
+    df_all["RR_sort"] = df_all["RR"].fillna(-1.0)
 
     df_all = df_all.sort_values(
         ["P", "RR_sort", "Score", "Avg$Vol"],
@@ -3616,42 +3405,14 @@ def main():
                 # ✅ 점수/유동성 상위부터 승격 (need만큼)
                 if not cand.empty:
                     cand = cand.sort_values(["Score", "Avg$Vol"], ascending=[False, False]).head(need).copy()
-                    rs_lookback = int(getattr(cfg, "RS_LOOKBACK_DAYS", 20))
+
+                    # ✅ 승격 처리
+                    # ✅ 승격 처리
                     def _tag(row):
                         row["Entry"] = "BUY_SMART"
                         row["Promoted"] = True
                         row["PromoTag"] = "🟣✅ PROMOTED"
-                        # ✅ Promoted 종목도 RS_vs_SPY 채우기 (data 우선, 없으면 yf 직접 조회)
-                        if (not row.get("RS_vs_SPY") or not str(row.get("RS_vs_SPY", "")).strip()):
-                            tkr = row.get("Ticker", None)
-                            if tkr:
-                                df_t, spy_close = None, None
-                                try:
-                                    if data is not None and isinstance(data.columns, pd.MultiIndex) and tkr in data.columns.get_level_values(0) and "SPY" in data.columns.get_level_values(0):
-                                        df_t = data[tkr].copy()
-                                        if isinstance(df_t.columns, pd.MultiIndex):
-                                            df_t.columns = df_t.columns.get_level_values(0)
-                                        spy_close = data["SPY"]["Close"].copy()
-                                except Exception:
-                                    pass
-                                if (df_t is None or df_t.empty or spy_close is None) or len(df_t) < rs_lookback + 1:
-                                    try:
-                                        dl = yf.download([tkr, "SPY"], period="1y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=False)
-                                        if dl is not None and not dl.empty:
-                                            if isinstance(dl.columns, pd.MultiIndex) and tkr in dl.columns.get_level_values(0) and "SPY" in dl.columns.get_level_values(0):
-                                                df_t = dl[tkr].copy()
-                                                if isinstance(df_t.columns, pd.MultiIndex):
-                                                    df_t.columns = df_t.columns.get_level_values(0)
-                                                spy_close = dl["SPY"]["Close"].copy()
-                                    except Exception:
-                                        pass
-                                if df_t is not None and not df_t.empty and spy_close is not None and len(df_t) >= rs_lookback + 1:
-                                    try:
-                                        stock_ret, spy_ret = compute_rs_vs_spy(df_t, spy_close, rs_lookback)
-                                        if stock_ret is not None and spy_ret is not None:
-                                            row["RS_vs_SPY"] = f"종목 {stock_ret*100:.1f}% vs SPY {spy_ret*100:.1f}%"
-                                    except Exception:
-                                        pass
+
                         # 🔥 승격 시에도 트레이드 플랜 생성 (안정 버전)
                         try:
                             tkr = row.get("Ticker", None)
@@ -3713,20 +3474,16 @@ def main():
                         except Exception:
                             return row
 
-                        drop_reason = str(row.get("Note", "")).strip() or "(사유 없음)"
-                        promo_reason = "SMART 승격 (RR/볼륨 완화 조건 충족)"
-                        row["Note"] = f"[BUY 탈락 이유: {drop_reason}] [Promoted 선정 이유: {promo_reason}]"
+                        row["Note"] = (str(row.get("Note", "")) + " | 🟣✅ PROMOTED (SMART)").strip(" |")
                         return row
+
 
                     cand = cand.apply(_tag, axis=1)
                     # ✅ 승격 성공한 것만 사용
                     cand = cand[cand.get("Promoted", False) == True].copy()
 
-                    # buy_df에 합치기 (한쪽이 비어 있으면 그대로 대입하여 concat 경고 방지)
-                    if buy_df.empty:
-                        buy_df = cand.copy()
-                    else:
-                        buy_df = pd.concat([buy_df, cand], ignore_index=True)
+                    # buy_df에 합치기
+                    buy_df = pd.concat([buy_df, cand], ignore_index=True)
                     buy_df = buy_df.head(cfg.MAX_BUY_PER_DAY)
                     # ✅ (방탄) BUY 리스트에 플랜 없는 행 제거 (NaN Shares 방지)
                     if buy_df is not None and isinstance(buy_df, pd.DataFrame) and not buy_df.empty:
@@ -3736,9 +3493,7 @@ def main():
 
                         buy_df = buy_df.dropna(subset=["Shares", "PosValue", "EntryPrice", "StopPrice", "TargetPrice"]).copy()
 
-    # BUY 리스트를 EV(기대값) 순으로 정렬 — 상단일수록 더 투자하기 좋은 순서
-    if buy_df is not None and not buy_df.empty:
-        buy_df = ev_rank_top_picks(buy_df, n=cfg.MAX_BUY_PER_DAY)
+                    
 
     watch_df_all = df_all[df_all["Entry"].astype(str).str.startswith("WATCH_")].copy()
 
@@ -3756,44 +3511,6 @@ def main():
         watch_df = pd.DataFrame(picked_w)
     else:
         watch_df = watch_df_all.head(cfg.WATCH_LIMIT).copy()
-
-    # -----------------------------
-    # ✅ 실적 N거래일 이내 BUY/PROMOTED → WATCH 강등
-    # -----------------------------
-    downgrade_trading_days = int(getattr(cfg, "EARNINGS_DOWNGRADE_TRADING_DAYS", 5))
-    if downgrade_trading_days >= 0 and buy_df is not None and not buy_df.empty and "Ticker" in buy_df.columns:
-        try:
-            ref_date = pd.Timestamp(run_date).date() if run_date else datetime.now(timezone.utc).date()
-        except Exception:
-            ref_date = datetime.now(timezone.utc).date()
-        keep_buy = []
-        downgraded = []
-        for _, row in buy_df.iterrows():
-            t = str(row.get("Ticker", "")).upper().strip()
-            if not t:
-                keep_buy.append(row)
-                continue
-            trading_days_ahead = _trading_days_until_next_earnings(t, ref_date)
-            if trading_days_ahead is not None and 0 <= trading_days_ahead <= downgrade_trading_days:
-                r = row.to_dict()
-                r["Entry"] = "WATCH_EARNINGS"
-                r["EntryRaw"] = r.get("EntryRaw", row.get("Entry", ""))
-                r["Promoted"] = False
-                r["PromoTag"] = ""
-                orig_note = str(r.get("Note", "")).strip()
-                r["Note"] = (orig_note + " [실적 " + str(trading_days_ahead) + "거래일 전 → WATCH 강등]").strip(" |")
-                downgraded.append(r)
-            else:
-                keep_buy.append(row)
-        if downgraded:
-            buy_df = pd.DataFrame(keep_buy).reset_index(drop=True) if keep_buy else pd.DataFrame()
-            downgraded_df = pd.DataFrame(downgraded)
-            if not watch_df.empty and len(watch_df.columns) > 0:
-                for c in watch_df.columns:
-                    if c not in downgraded_df.columns:
-                        downgraded_df[c] = np.nan
-                downgraded_df = downgraded_df.reindex(columns=watch_df.columns, fill_value=np.nan)
-            watch_df = pd.concat([watch_df, downgraded_df], ignore_index=True)
 
     # -----------------------------
     # ✅ 보유 포지션 매도/익절 신호 (이미 받은 data 재사용)
@@ -3901,24 +3618,25 @@ def main():
     } for r in portfolio_recos])
 
 
-    # CSV 저장(기록) → scan_csv/ 폴더
+    # CSV 저장(기록)
     outname = f"us_swing_scanner_{run_date}.csv"
-    df_out.to_csv(os.path.join(SCAN_CSV_DIR, outname), index=False, encoding="utf-8-sig")
+    df_out.to_csv(outname, index=False, encoding="utf-8-sig")
 
     # 디스코드 Embed 3장 전송
     if "Promoted" not in buy_df.columns:
         buy_df["Promoted"] = False
     else:
-        buy_df["Promoted"] = buy_df["Promoted"].fillna(False).astype(bool)
+        buy_df["Promoted"] = buy_df["Promoted"].fillna(False)
 
 
-    # Top Pick 3 = BUY 리스트(EV 순) 상위 3종목
-    top_picks = buy_df.head(3).copy() if (buy_df is not None and not buy_df.empty) else pd.DataFrame()
+    # ✅ Top Pick 3는 EV(기대값) 기반으로 선정
+    top_picks = ev_rank_top_picks(buy_df, n=3)
 
     # ==============================
     # 🔥 여기 추가 (Streamlit 동기화 핵심)
     # ==============================
-    snapshot_path = os.path.join(SNAPSHOTS_DIR, f"scan_snapshot_{run_date}.json")
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    snapshot_path = os.path.join(BASE_DIR, f"scan_snapshot_{run_date}.json")
 
     # ✅ 실제 계산된 MARKET_STATE를 넣어야 Streamlit에서 market_state가 보임
     ms_for_snap = MARKET_STATE if isinstance(MARKET_STATE, dict) else {}
@@ -3984,7 +3702,7 @@ def main():
 
     discord_webhook_send_chunked(
         embeds,
-        content=f"CSV: {outname}"
+        content=f"계좌 ${cfg.ACCOUNT_EQUITY_USD:,} | 1R={cfg.RISK_PER_TRADE*100:.2f}% | CSV: {outname}"
     )
 
 

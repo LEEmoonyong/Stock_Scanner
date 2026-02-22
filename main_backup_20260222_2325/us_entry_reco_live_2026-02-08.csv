@@ -1,0 +1,21 @@
+﻿Ticker,Sector,Entry,Score,Close,MktCap_KRW_T,Avg$Vol,VolRatio,RSI,ATR%,Trigger,EntryHint,Invalidation,Reasons,Note
+DLR,Real Estate,BUY_BREAKOUT,35,171.62,87.9,329808478,1.68,64.3,2.55,20D High 173.90 돌파 확인 + Vol 1.68x,173.90 위에서 분할(돌파 유지 시),SMA50(158.67) 이탈 또는 Stop 162.85,"Vol 1.7x, RSI 64",돌파 실패(되밀림) 주의
+MPWR,Technology,BUY_BREAKOUT,25,1229.82,87.7,755739212,2.28,73.8,5.08,20D High 1250.00 돌파 확인 + Vol 2.28x,1250.00 위에서 분할(돌파 유지 시),SMA50(1001.84) 이탈 또는 Stop 1104.76,Vol 2.3x,돌파 실패(되밀림) 주의
+ROST,Consumer Cyclical,BUY_PULLBACK,45,190.74,90.8,475694004,1.27,46.5,1.89,SMA20(189.89) 눌림 후 반등 확인,190.74 부근 분할 또는 직전 고가 상향 시,SMA20(189.89) 명확 이탈 또는 Stop 183.52,"Vol 1.3x, MACD 개선, RSI 47",RSI 46.5
+WBD,Communication Services,BUY_PULLBACK,35,27.36,99.3,693241302,1.36,32.3,1.76,SMA50(27.74) 눌림 후 반등 확인,27.36 부근 분할 또는 직전 고가 상향 시,SMA50(27.74) 명확 이탈 또는 Stop 26.40,"Vol 1.4x, MACD 개선",RSI 32.3
+URI,Industrials,BUY_PULLBACK,30,899.55,83.8,708506144,1.17,46.9,4.24,SMA20(888.82) 눌림 후 반등 확인,899.55 부근 분할 또는 직전 고가 상향 시,SMA20(888.82) 명확 이탈 또는 Stop 823.32,"MACD 개선, RSI 47",RSI 46.9
+F,Consumer Cyclical,BUY_PULLBACK,20,13.8,80.5,862656023,0.89,54.1,2.1,SMA20(13.79) 눌림 후 반등 확인,13.80 부근 분할 또는 직전 고가 상향 시,SMA20(13.79) 명확 이탈 또는 Stop 13.22,RSI 54,RSI 54.1
+LHX,Industrials,BUY_PULLBACK,20,349.66,95.8,627285599,0.54,52.0,3.0,SMA20(347.24) 눌림 후 반등 확인,349.66 부근 분할 또는 직전 고가 상향 시,SMA20(347.24) 명확 이탈 또는 Stop 328.67,RSI 52,RSI 52.0
+SRE,Utilities,BUY_PULLBACK,20,87.36,83.5,413126056,1.01,27.6,2.33,SMA20(87.92) 눌림 후 반등 확인,87.36 부근 분할 또는 직전 고가 상향 시,SMA20(87.92) 명확 이탈 또는 Stop 83.29,MACD 개선,RSI 27.6
+VLO,Energy,WATCH_BREAKOUT,50,202.68,92.2,638364438,0.84,71.7,3.49,트리거: 203.14 상향 돌파(20D High),203.14 돌파 + 거래량 동반 시,SMA50(177.45) 이탈 또는 Stop 188.52,"20D high 근접, MACD 개선, RSI 72",현재 Vol 0.84x
+TRV,Financial Services,WATCH_BREAKOUT,40,301.49,98.5,517416598,1.07,96.5,1.98,트리거: 304.40 상향 돌파(20D High),304.40 돌파 + 거래량 동반 시,SMA50(285.44) 이탈 또는 Stop 289.57,"20D high 근접, MACD 개선",현재 Vol 1.07x
+MPC,Energy,WATCH_BREAKOUT,40,203.0,89.3,436418074,0.96,83.8,3.24,트리거: 204.37 상향 돌파(20D High),204.37 돌파 + 거래량 동반 시,SMA50(179.12) 이탈 또는 Stop 189.86,"20D high 근접, MACD 개선",현재 Vol 0.96x
+PSX,Energy,WATCH_BREAKOUT,40,157.8,93.4,354970719,0.98,85.4,2.84,트리거: 159.15 상향 돌파(20D High),159.15 돌파 + 거래량 동반 시,SMA50(138.66) 이탈 또는 Stop 148.85,"20D high 근접, MACD 개선",현재 Vol 0.98x
+GWW,Industrials,WATCH_BREAKOUT,40,1197.65,83.9,338576621,0.76,74.9,2.37,트리거: 1204.36 상향 돌파(20D High),1204.36 돌파 + 거래량 동반 시,SMA50(1033.42) 이탈 또는 Stop 1140.83,"20D high 근접, MACD 개선",현재 Vol 0.76x
+BDX,Healthcare,WATCH_BREAKOUT,25,210.02,87.6,409643672,1.12,54.9,2.4,트리거: 213.08 상향 돌파(20D High),213.08 돌파 + 거래량 동반 시,SMA50(199.55) 이탈 또는 Stop 199.92,"MACD 개선, RSI 55",현재 Vol 1.12x
+O,Real Estate,WATCH_BREAKOUT,25,63.23,85.0,392892866,0.73,61.6,1.59,트리거: 63.90 상향 돌파(20D High),63.90 돌파 + 거래량 동반 시,SMA50(58.72) 이탈 또는 Stop 61.22,"MACD 개선, RSI 62",현재 Vol 0.73x
+AEP,Utilities,WATCH_BREAKOUT,15,120.8,94.7,404481887,0.81,53.4,1.85,트리거: 122.44 상향 돌파(20D High),122.44 돌파 + 거래량 동반 시,SMA50(117.38) 이탈 또는 Stop 116.32,RSI 53,현재 Vol 0.81x
+FTNT,Technology,SKIP,25,82.76,92.8,582419546,2.08,68.4,3.56,진입 타이밍 불명확,-,Stop 76.87,"Vol 2.1x, RSI 68",대기
+AFL,Financial Services,SKIP,25,117.15,89.9,277010238,1.22,76.8,2.11,진입 타이밍 불명확,-,Stop 112.20,"Vol 1.2x, MACD 개선",대기
+ZTS,Healthcare,SKIP,20,127.42,82.7,577210779,0.89,57.1,2.48,진입 타이밍 불명확,-,Stop 121.10,"MACD 개선, RSI 57",대기
+APD,Basic Materials,SKIP,20,283.12,92.3,406533052,0.65,62.4,2.46,진입 타이밍 불명확,-,Stop 269.21,"MACD 개선, RSI 62",대기
