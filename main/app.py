@@ -536,6 +536,40 @@ def _strip_html_summary(raw: str, max_len: int = 200) -> str:
     return (s[:max_len] + "…") if len(s) > max_len else s
 
 
+def _normalize_news_title(raw: str) -> str:
+    """
+    뉴스 제목에서 쌍따옴표/특수 따옴표로 인한 렌더링 깨짐을 방지.
+    - 양쪽을 감싸는 큰따옴표(“중동 쇼크”) 형태면 따옴표 제거.
+    - 안쪽의 따옴표는 일반 쌍따옴표로 통일.
+    - HTML 태그(<b>중동</b> 같은)와 제어문자는 모두 제거.
+    """
+    if not raw:
+        return ""
+    s = str(raw)
+    # HTML 엔티티/태그 제거
+    try:
+        s = html.unescape(s)
+    except Exception:
+        pass
+    s = re.sub(r"<[^>]+>", " ", s)
+    # 줄바꿈/공백 정리
+    s = s.replace("\n", " ").replace("\r", " ")
+    # 다양한 따옴표/백틱 문자 통일/제거 (마크다운 코드/강조 깨짐 방지)
+    for ch in ["“", "”", "„", "‟", "＂", "˝"]:
+        s = s.replace(ch, "\"")
+    # 백틱(`)류는 전부 제거해서 코드 스타일로 렌더링되는 것 방지
+    for ch in ["`", "´", "｀"]:
+        s = s.replace(ch, "")
+    s = s.strip()
+    # 양 끝이 쌍따옴표면 제거
+    if len(s) >= 2 and s[0] == "\"" and s[-1] == "\"":
+        s = s[1:-1].strip()
+    # 제어문자 제거 + 공백 재정리
+    s = "".join(ch for ch in s if ch.isprintable())
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 try:
     from article_summary_utils import clean_article_noise, extract_3_sentences, validate_summary
 except ImportError:
@@ -620,17 +654,27 @@ def _is_meaningful_rss_summary(rss: str, title: str) -> bool:
 
 def _enrich_news_with_summaries(items: list, cache_buster: str = "") -> list:
     """기사 목록에 실제 본문 기반 3줄 요약 추가 (병렬). 제목과 같은 RSS 요약은 사용 안 함."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
     out = []
     with ThreadPoolExecutor(max_workers=4) as ex:
         futures = {ex.submit(_summarize_article_from_url, n.get("link", ""), n.get("title", ""), cache_buster): i for i, n in enumerate(items)}
         summaries = [""] * len(items)
-        for f in as_completed(futures, timeout=35):
-            i = futures[f]
-            try:
-                summaries[i] = f.result() or ""
-            except Exception:
-                pass
+        try:
+            for f in as_completed(futures, timeout=60):
+                i = futures[f]
+                try:
+                    summaries[i] = f.result(timeout=5) or ""
+                except Exception:
+                    pass
+        except FuturesTimeoutError:
+            # 타임아웃 시 완료된 것만 반영, 나머지는 RSS 요약/빈 문자열로 대체
+            for f in futures:
+                if f.done():
+                    try:
+                        i = futures[f]
+                        summaries[i] = f.result(timeout=0) or ""
+                    except Exception:
+                        pass
     for i, n in enumerate(items):
         s = summaries[i] if i < len(summaries) else ""
         if not s:
@@ -667,27 +711,63 @@ def _format_pub_kr(pub_raw: str = "", parsed: Optional[tuple] = None) -> str:
 
 @st.cache_data(show_spinner=False, ttl=60 * 15)
 def _fetch_market_news_raw(region: str) -> tuple:
-    """RSS에서 시장 주요 기사 최대 10개 수집. (items, error_msg) 반환."""
+    """
+    RSS에서 시장 주요 기사 최대 10개 수집. (items, error_msg) 반환.
+    - 항상 최신성 우선: 현재 시점 기준 24시간 이내 기사만 사용.
+    - 조회수/인기 데이터는 없으므로, Google News 정렬 + 발행시각 내림차순으로 정렬해
+      "인기·주요" 기사에 최대한 가깝게 근사.
+    """
+    from datetime import datetime, timedelta, timezone
+    from email.utils import parsedate_to_datetime
+
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc - timedelta(days=1)
     if region == "us":
+        # 미국: 기본 쿼리 그대로 사용 (이미 10개 잘 나옴)
         q = urllib.parse.quote("US stock market Wall Street")
         urls = [f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"]
     else:
-        q = urllib.parse.quote("한국 증시 주식 코스피")
-        urls = [f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"]
+        # 한국: 한 쿼리에서 기사가 너무 적게 나오는 경우가 있어,
+        # 여러 쿼리를 합쳐서 풀을 넓힌 뒤 상위 10개를 뽑는다.
+        q1 = urllib.parse.quote("한국 증시 OR 코스피 OR 코스닥 when:1d")
+        q2 = urllib.parse.quote("코스피 지수 when:1d")
+        q3 = urllib.parse.quote("코스닥 지수 when:1d")
+        urls = [
+            f"https://news.google.com/rss/search?q={q1}&hl=ko&gl=KR&ceid=KR:ko",
+            f"https://news.google.com/rss/search?q={q2}&hl=ko&gl=KR&ceid=KR:ko",
+            f"https://news.google.com/rss/search?q={q3}&hl=ko&gl=KR&ceid=KR:ko",
+        ]
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"}
     last_err = ""
     for url in urls:
         if feedparser is not None:
             try:
                 parsed = feedparser.parse(url, request_headers=headers)
-                entries = getattr(parsed, "entries", [])[:10]
-                items = []
+                entries = getattr(parsed, "entries", [])  # 전체에서 24시간 필터 후 상위 10개
+                fresh_items = []
+                older_items = []
                 for e in entries:
                     title = (e.get("title") or "").strip()
                     link = (e.get("link") or "").strip()
-                    parsed = e.get("published_parsed") or e.get("updated_parsed")
+                    parsed_dt = e.get("published_parsed") or e.get("updated_parsed")
                     pub_raw = e.get("published") or e.get("updated") or ""
-                    pub = _format_pub_kr(pub_raw, parsed)
+
+                    # 발행 시각 → datetime (UTC 기준)으로 변환
+                    pub_dt_utc = None
+                    try:
+                        if parsed_dt:
+                            dt = datetime(*parsed_dt[:6], tzinfo=timezone.utc)
+                        else:
+                            dt = parsedate_to_datetime(pub_raw)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            else:
+                                dt = dt.astimezone(timezone.utc)
+                        pub_dt_utc = dt
+                    except Exception:
+                        pub_dt_utc = None
+
+                    pub = _format_pub_kr(pub_raw, parsed_dt)
                     src = e.get("source")
                     source = ""
                     if src:
@@ -701,7 +781,34 @@ def _fetch_market_news_raw(region: str) -> tuple:
                         summary_raw = cnt[0].get("value", "") if isinstance(cnt, list) and cnt else ""
                     rss_summary = _strip_html_summary(summary_raw, max_len=300)
                     if title and link:
-                        items.append({"title": title, "link": link, "pub": pub, "source": source, "rss_summary": rss_summary})
+                        item = {
+                            "title": title,
+                            "link": link,
+                            "pub": pub,
+                            "source": source,
+                            "rss_summary": rss_summary,
+                            "_dt": pub_dt_utc,
+                        }
+                        if pub_dt_utc is not None and pub_dt_utc >= cutoff:
+                            fresh_items.append(item)
+                        else:
+                            older_items.append(item)
+
+                # 1순위: 24시간 이내 기사, 2순위: 그 이전 기사로 채워서 최대 10개
+                fresh_items = sorted(
+                    fresh_items,
+                    key=lambda x: (x.get("_dt") is None, x.get("_dt")),
+                    reverse=True,
+                )
+                older_items = sorted(
+                    older_items,
+                    key=lambda x: (x.get("_dt") is None, x.get("_dt")),
+                    reverse=True,
+                )
+                items = (fresh_items + older_items)[:10]
+                # 내부 정렬용 필드 제거
+                for it in items:
+                    it.pop("_dt", None)
                 if items:
                     return (items, "")
             except Exception as e:
@@ -738,6 +845,19 @@ def _fetch_market_news_raw(region: str) -> tuple:
                 title = (title_el.text or "").strip() if title_el is not None else ""
                 link = (getattr(link_el, "attrib", {}).get("href") or (link_el.text or "")).strip() if link_el is not None else ""
                 pub_raw = (pub_el.text or "").strip() if pub_el is not None and pub_el.text else ""
+
+                # 발행 시각 → datetime (UTC) 변환
+                pub_dt_utc = None
+                try:
+                    dt = parsedate_to_datetime(pub_raw)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    else:
+                        dt = dt.astimezone(timezone.utc)
+                    pub_dt_utc = dt
+                except Exception:
+                    pub_dt_utc = None
+
                 pub = _format_pub_kr(pub_raw)
                 source = ""
                 if source_el is not None:
@@ -751,8 +871,31 @@ def _fetch_market_news_raw(region: str) -> tuple:
                         summary_raw = "".join(desc_el.itertext()).strip()
                 rss_summary = _strip_html_summary(summary_raw, max_len=300)
                 if title and link:
-                    items.append({"title": title, "link": link, "pub": pub, "source": source, "rss_summary": rss_summary})
-            items = items[:10]
+                    items.append({
+                        "title": title,
+                        "link": link,
+                        "pub": pub,
+                        "source": source,
+                        "rss_summary": rss_summary,
+                        "_dt": pub_dt_utc,
+                    })
+            # 발행시각 기준 내림차순 정렬:
+            # 1순위: 24시간 이내 기사, 2순위: 그 이전 기사로 최대 10개 채우기
+            fresh_items = [it for it in items if it.get("_dt") is not None and it["_dt"] >= cutoff]
+            older_items = [it for it in items if it not in fresh_items]
+            fresh_items = sorted(
+                fresh_items,
+                key=lambda x: (x.get("_dt") is None, x.get("_dt")),
+                reverse=True,
+            )
+            older_items = sorted(
+                older_items,
+                key=lambda x: (x.get("_dt") is None, x.get("_dt")),
+                reverse=True,
+            )
+            items = (fresh_items + older_items)[:10]
+            for it in items:
+                it.pop("_dt", None)
             if items:
                 return (items, "")
         except Exception as e:
@@ -822,7 +965,7 @@ def _render_ticker_news(news: list, ticker: str):
         return
     st.markdown(f"**📰 {ticker} 관련 최신 뉴스 ({len(news)}개)**")
     for i, n in enumerate(news, 1):
-        t = (n.get("title", "") or "").replace("\n", " ").strip()
+        t = _normalize_news_title(n.get("title", "") or "")
         with st.expander(f"{i}. {t}", expanded=False):
             if n.get("summary"):
                 st.markdown(n["summary"].replace("\n", "\n\n"))
@@ -836,10 +979,10 @@ def _render_ticker_news(news: list, ticker: str):
                 st.caption(" · ".join(caps))
 
 def hard_refresh():
-    # 미국 최근 종가 기준 전 데이터 최신화 (세션 전체 clear 없이 캐시/스냅/트래커만 정리)
+    # 미국/한국 최근 종가 기준 전 데이터 최신화 (세션 전체 clear 없이 캐시/스냅/트래커만 정리)
     st.session_state["data_refresh_ts"] = datetime.now().isoformat()
     st.cache_data.clear()
-    # ohlcv.db(로컬 SQLite)도 삭제 → 다음 fetch 시 yfinance에서 새로 받음
+    # ohlcv.db(로컬 SQLite) 삭제 → 다음 fetch 시 yfinance/FinanceDataReader에서 새로 받음 (한국 종가 반영)
     ohlcv_db = os.path.join(BASE_DIR, "cache", "ohlcv.db")
     if os.path.exists(ohlcv_db):
         try:
@@ -847,6 +990,7 @@ def hard_refresh():
         except OSError:
             pass
     st.session_state.pop("scan_snap", None)
+    st.session_state.pop("kr_scan_snap", None)
     st.session_state.pop("tp3_tracker", None)
     st.rerun()
 
@@ -862,17 +1006,39 @@ def _should_drop_today_bar_us() -> bool:
         return True
 
 
-def _drop_today_bar_if_needed(df: pd.DataFrame) -> pd.DataFrame:
+def _should_drop_today_bar_kr() -> bool:
+    """한국 장중에는 오늘 진행중 봉 제외 (15:30 KST 장마감 이후엔 미제외)"""
+    try:
+        kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        if kst.weekday() >= 5:
+            return False
+        if (kst.hour > 15) or (kst.hour == 15 and kst.minute >= 30):
+            return False
+        return True
+    except Exception:
+        return True
+
+
+def _drop_today_bar_if_needed(df: pd.DataFrame, ticker: str = "") -> pd.DataFrame:
     if df is None or df.empty:
         return df
 
     try:
-        if not _should_drop_today_bar_us():
+        t_u = (ticker or "").upper()
+        # 한국 종목 + 한국 지수(^KS11, ^KQ11 등)는 모두 한국장 기준으로 today 처리
+        is_kr = t_u and (".KS" in t_u or ".KQ" in t_u or t_u.startswith("^K"))
+        if is_kr:
+            should_drop = _should_drop_today_bar_kr()
+            ref_today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+        else:
+            should_drop = _should_drop_today_bar_us()
+            ref_today = datetime.now(ZoneInfo("America/New_York")).date()
+
+        if not should_drop:
             return df
 
-        et_today = datetime.now(ZoneInfo("America/New_York")).date()
         last_dt = pd.to_datetime(df.index[-1]).date()
-        if last_dt >= et_today:
+        if last_dt >= ref_today:
             return df.iloc[:-1].copy()
     except Exception:
         pass
@@ -897,7 +1063,10 @@ def _fetch_price_inner(
             debug_out.append(msg)
 
     def _download(days: int, need_rows: int = 0) -> Optional[pd.DataFrame]:
-        end = datetime.now(ZoneInfo("America/New_York")).date()
+        t_u = (ticker or "").upper()
+        is_kr = t_u and (".KS" in t_u or ".KQ" in t_u or t_u.startswith("^K"))
+        tz = ZoneInfo("Asia/Seoul") if is_kr else ZoneInfo("America/New_York")
+        end = datetime.now(tz).date()
         start = end - timedelta(days=int(days))
 
         df = None
@@ -938,7 +1107,7 @@ def _fetch_price_inner(
         before_dropna = len(df)
         df = df.dropna(subset=need_cols).copy()
         after_dropna = len(df)
-        df = _drop_today_bar_if_needed(df)
+        df = _drop_today_bar_if_needed(df, ticker)
         after_drop_today = len(df)
         _log(f"after processing: before_dropna={before_dropna}, after_dropna={after_dropna}, after_drop_today={after_drop_today}")
         return df
@@ -1056,6 +1225,106 @@ def _get_kr_name_to_ticker_full() -> dict:
         except Exception:
             pass
     return out
+
+
+def _get_kr_display_name(sym: str) -> str:
+    """
+    한국 종목 티커(.KS/.KQ)를 사람이 보기 좋은 종목명(한국어)으로 변환.
+    1순위: ticker_universe_kr.TICKER_TO_NAME
+    2순위: _get_kr_name_to_ticker_full()의 역매핑
+    실패 시에는 원래 티커 문자열(sym) 그대로 반환.
+    """
+    s = (sym or "").upper().strip()
+    if not s or (".KS" not in s and ".KQ" not in s):
+        return s
+
+    # 1) 미리 정의된 유니버스 매핑
+    if s in TICKER_TO_NAME and TICKER_TO_NAME[s]:
+        return str(TICKER_TO_NAME[s])
+
+    # 2) 전체 시장 매핑 역추적 (이름 → 티커 맵을 뒤집어서 사용)
+    try:
+        full_map = _get_kr_name_to_ticker_full()
+        for name, ticker in full_map.items():
+            if str(ticker).upper().strip() == s:
+                return str(name)
+    except Exception:
+        pass
+
+    return s
+
+
+def _normalize_kr_ticker(sym: str) -> str:
+    """
+    코스피/코스닥 구분을 위해 한국 종목 티커를 정규화.
+    - 입력: '086520.KS' 또는 '086520.KQ'
+    - 출력: 실제 상장 시장 기준으로 '.KS' 또는 '.KQ'를 붙인 티커 문자열.
+    우선순위:
+      1) ticker_universe_kr.TICKER_TO_NAME 키(유니버스 정의에 따른 시장)
+      2) pykrx.get_market_ticker_list(KOSPI/KOSDAQ)
+      3) FinanceDataReader.StockListing(KOSPI/KOSDAQ)
+      4) 실패 시 기존 suffix 유지
+    """
+    s = (sym or "").upper().strip()
+    if not s:
+        return s
+    has_suffix = (".KS" in s) or (".KQ" in s)
+    base = s.replace(".KS", "").replace(".KQ", "").strip()
+    if not base.isdigit():
+        return s
+    base = base.zfill(6)
+
+    # 1) 유니버스 매핑에서 시장 판별
+    try:
+        for tk in TICKER_TO_NAME.keys():
+            tk_u = str(tk).upper().strip()
+            if ".KS" not in tk_u and ".KQ" not in tk_u:
+                continue
+            tk_base = tk_u.replace(".KS", "").replace(".KQ", "").strip()
+            if tk_base == base:
+                return tk_u
+    except Exception:
+        pass
+
+    # 2) pykrx로 시장 판별
+    try:
+        from datetime import date
+        from pykrx import stock
+        dt = date.today().strftime("%Y%m%d")
+        for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ")]:
+            try:
+                tickers = stock.get_market_ticker_list(dt, market=market) or []
+                norm_list = {str(t).zfill(6) for t in tickers}
+                if base in norm_list:
+                    return base + suffix
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 3) FinanceDataReader로 시장 판별
+    try:
+        import FinanceDataReader as fdr
+        for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ")]:
+            try:
+                df = fdr.StockListing(market)
+                if df is None or df.empty:
+                    continue
+                code_col = "Code" if "Code" in df.columns else "Symbol"
+                if code_col not in df.columns:
+                    continue
+                codes = {str(c).zfill(6) for c in df[code_col].dropna().astype(str)}
+                if base in codes:
+                    return base + suffix
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # 4) 실패 시 기존 suffix 유지
+    if has_suffix:
+        return base + (".KQ" if s.endswith(".KQ") else ".KS")
+    return base
 
 
 def _resolve_kr_name_or_ticker(user_input: str) -> str:
@@ -1262,7 +1531,7 @@ KR_DEFAULT_TICKERS = [
     "005930.KS", "000660.KS", "035420.KS", "051910.KS", "207940.KS",
     "005380.KS", "000270.KS", "068270.KS", "006400.KS", "035720.KS",  # 000270=기아
     "105560.KS", "003670.KS", "032830.KS", "017670.KS", "000810.KS",
-    "247540.KS", "086520.KS", "034730.KS", "066570.KS", "009150.KS",
+    "247540.KQ", "086520.KS", "034730.KS", "066570.KS", "009150.KS",
 ]
 
 
@@ -1272,15 +1541,32 @@ def _fetch_trending_kr_tickers(count: int = 20) -> pd.DataFrame:
     rows = []
     for i, sym in enumerate(KR_DEFAULT_TICKERS[:count], 1):
         try:
-            t = yf.Ticker(sym)
+            # 코스피/코스닥 시장 기준으로 티커 정규화
+            norm_sym = _normalize_kr_ticker(sym)
+
+            t = yf.Ticker(norm_sym)
             info = t.info or {}
             price = info.get("regularMarketPrice") or info.get("currentPrice")
             chg = info.get("regularMarketChangePercent")
-            name = info.get("shortName") or info.get("longName") or sym
+            # 종목명은 한국어 기준으로 우선 표시
+            name = _get_kr_display_name(norm_sym)
+            # 매핑 실패 시에만 yfinance 이름 사용.
+            # 0P000... 같은 내부 코드도, 요청에 따라 티커와 함께 그대로 노출.
+            if name == norm_sym or name == sym:
+                raw_name = info.get("shortName") or info.get("longName")
+                if raw_name:
+                    rn = str(raw_name).strip()
+                    # 내부 코드처럼 보이면 "티커,코드" 형태로 그대로 보여주기
+                    if rn.startswith("0P000"):
+                        name = f"{norm_sym},{rn}"
+                    else:
+                        name = rn
+            # 최종 표시는 회사명만 사용 (예: 에코프로). .KS/.KQ는 Ticker 컬럼에만 유지.
+            display_name = name
             rows.append({
                 "순위": i,
-                "Ticker": sym,
-                "종목명": (str(name)[:20] + "…") if len(str(name)) > 20 else str(name),
+                "Ticker": norm_sym,
+                "종목명": (str(display_name)[:20] + "…") if len(str(display_name)) > 20 else str(display_name),
                 "현재가": float(price) if price is not None and np.isfinite(float(price)) else None,
                 "등락률(%)": float(chg) if chg is not None and np.isfinite(float(chg)) else None,
                 "거래량": None,
@@ -1658,7 +1944,6 @@ def plot_candles_with_signals(
     st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
 
-@st.cache_data(show_spinner=False, ttl=60)
 def load_tracker(path=TRACKER_CSV):
     if not os.path.exists(path):
         return pd.DataFrame(columns=[
@@ -1710,6 +1995,26 @@ def _parse_run_date(run_date_like) -> Optional[datetime.date]:
         return pd.to_datetime(str(run_date_like)).date()
     except Exception:
         return None
+
+def _prev_trading_day(d: date) -> date:
+    """d의 바로 전 거래일 (주말 스킵)."""
+    prev = d - timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev = prev - timedelta(days=1)
+    return prev
+
+
+def _close_on_prev_trading_day(ticker: str, signal_date) -> tuple:
+    """SignalDate의 전 거래일 종가 반환. Entry Price = 신호일 전일 종가(Prev Close). (close_price, prev_date) 또는 (None, None)."""
+    try:
+        d = _parse_run_date(signal_date) if not isinstance(signal_date, date) else signal_date
+        if d is None:
+            return None, None
+        prev_d = _prev_trading_day(d)
+        return _close_on_date(ticker, prev_d)
+    except Exception:
+        return None, None
+
 
 def _close_on_date(ticker: str, target_date) -> tuple:
     """target_date( date 또는 str YYYY-MM-DD )에 해당하는 종가 반환. (close_price, target_date) 또는 (None, None)."""
@@ -1835,9 +2140,15 @@ def seed_tracker_from_recent_snapshots(
         if already_open:
             continue
 
-        # snapshot 날짜 d가 있으면 해당일 종가로 Entry 설정; 없으면 신호날 종가 규칙 (EntryDate=SignalDate)
+        # Entry Price: KR=신호일 종가, US=신호일 전 거래일 종가 (Prev Close)
+        is_kr_seed = tracker_path is not None and "kr" in str(tracker_path).lower()
         if d is not None:
-            entry_price, entry_date_px = _close_on_date(t, d)
+            if is_kr_seed:
+                entry_price, entry_date_px = _close_on_date(t, d)
+            else:
+                entry_price, entry_date_px = _close_on_prev_trading_day(t, d)
+                if entry_price is None:
+                    entry_price, entry_date_px = _close_on_date(t, d)
             signal_date = d
             if entry_price is None or entry_date_px is None:
                 continue
@@ -1907,12 +2218,65 @@ def _fetch_recent_close(ticker: str, min_rows: int = 2) -> Optional[pd.DataFrame
     return _fetch_price_inner(ticker, 30, get_cache_buster(), min_rows=min_rows)
 
 
+def _get_ref_trading_date(ticker: str):
+    """
+    시장 마감 기준 '현재 마지막 거래일' 반환.
+    - US: 16:20 ET 이후 → 오늘(ET), 그 전 → 어제
+    - KR: 15:30 KST 이후 → 오늘(KST), 그 전 → 어제
+    주말이면 해당 금요일 등 이전 거래일로 스킵.
+    """
+    t_u = (ticker or "").upper()
+    is_kr = t_u and (".KS" in t_u or ".KQ" in t_u or t_u.startswith("^K"))
+    try:
+        if is_kr:
+            kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        else:
+            kst = datetime.now(ZoneInfo("America/New_York"))
+        d = kst.date()
+        # 주말: 이전 거래일로
+        while d.weekday() >= 5:
+            d = d - timedelta(days=1)
+        if is_kr:
+            closed = (kst.hour > 15) or (kst.hour == 15 and kst.minute >= 30)
+        else:
+            closed = (kst.hour > 16) or (kst.hour == 16 and kst.minute >= 20)
+        if closed:
+            return d
+        # 장중: 전 거래일
+        d = d - timedelta(days=1)
+        while d.weekday() >= 5:
+            d = d - timedelta(days=1)
+        return d
+    except Exception:
+        return None
+
+
 def _current_close(ticker: str):
-    """단일 소스: 모든 섹션에서 동일한 종가 사용."""
+    """단일 소스: 모든 섹션에서 동일한 종가 사용. 시장 마감 후 DaysHeld 정확 반영을 위해 ref_trading_date 적용."""
     df = _fetch_recent_close(ticker)
     if df is None or df.empty or len(df) < 2:
         return None, None
-    return float(df["Close"].iloc[-1]), _ensure_dt(df.index[-1])
+    close_val = float(df["Close"].iloc[-1])
+    last_row_date = _ensure_dt(df.index[-1])
+    ref_date = _get_ref_trading_date(ticker)
+    # 시장 마감 후: cur_date 설정. US는 시장 마감 후 ref_date+1 (한국 시간 기준 다음날 반영)
+    if ref_date is not None:
+        t_u = (ticker or "").upper()
+        is_kr = t_u and (".KS" in t_u or ".KQ" in t_u or t_u.startswith("^K"))
+        try:
+            now = datetime.now(ZoneInfo("Asia/Seoul")) if is_kr else datetime.now(ZoneInfo("America/New_York"))
+            if now.weekday() < 5:
+                closed = (now.hour > 15) or (now.hour == 15 and now.minute >= 30) if is_kr else (now.hour > 16) or (now.hour == 16 and now.minute >= 20)
+                if closed:
+                    # US: 장 마감 후 cur_date = ref_date+1 (DaysHeld 올바른 증가)
+                    cur_d = ref_date + timedelta(days=1) if not is_kr else ref_date
+                    return close_val, cur_d
+        except Exception:
+            pass
+    # 시장 개장 중이거나 ref 없음: 데이터 기준
+    if ref_date is not None and last_row_date is not None and ref_date > last_row_date:
+        return close_val, ref_date
+    return close_val, last_row_date
 
 
 def _exit_signal_from_scanner(ticker: str, shares: float = 1.0, avg_price: float = 1.0, days_held=None, max_hold_days=None):
@@ -2074,8 +2438,14 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             continue
 
         if run_date is not None:
-            entry_price, _ = _close_on_date(t, run_date)
-            # run_date 해당일 봉이 없으면(장 마감 전/데이터 지연) 최신 가용 종가로 폴백 → 트래커 누락 방지
+            # KR: 오늘 스캔 선정 → Entry = 오늘 종가. US: Entry = 신호일 전 거래일 종가(Prev Close)
+            is_kr_tracker = tracker_path is not None and "kr" in str(tracker_path).lower()
+            if is_kr_tracker:
+                entry_price, _ = _close_on_date(t, run_date)
+            else:
+                entry_price, _ = _close_on_prev_trading_day(t, run_date)
+            if entry_price is None and not is_kr_tracker:
+                entry_price, _ = _close_on_date(t, run_date)
             if entry_price is None:
                 entry_price, _ = _entry_price_on_signal_date(t)
             if entry_price is None:
@@ -2084,8 +2454,17 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             signal_date = pd.Timestamp(run_date)
             entry_date = pd.Timestamp(run_date)
         else:
-            entry_price, signal_date = _entry_price_on_signal_date(t)
-            if entry_price is None or signal_date is None:
+            _, signal_date = _entry_price_on_signal_date(t)
+            if signal_date is None:
+                continue
+            is_kr_tracker = tracker_path is not None and "kr" in str(tracker_path).lower()
+            if is_kr_tracker:
+                entry_price, _ = _close_on_date(t, signal_date)
+            else:
+                entry_price, _ = _close_on_prev_trading_day(t, signal_date)
+            if entry_price is None:
+                entry_price, _ = _entry_price_on_signal_date(t)
+            if entry_price is None:
                 continue
             entry_date = signal_date  # EntryDate = SignalDate
 
@@ -2164,6 +2543,24 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             continue
 
         entry_price = row.get("EntryPrice", None)
+        signal_date = _ensure_dt(row.get("SignalDate"))
+
+        # EntryPrice 보정: KR=신호일 종가, US=신호일 전 거래일 종가(Prev Close)
+        is_kr_tracker = tracker_path is not None and "kr" in str(tracker_path).lower()
+        if signal_date is not None:
+            try:
+                fix_price, _ = _close_on_date(t, signal_date) if is_kr_tracker else _close_on_prev_trading_day(t, signal_date)
+                if fix_price is not None and np.isfinite(fix_price):
+                    try:
+                        cur_ep = float(entry_price) if entry_price is not None and np.isfinite(float(entry_price)) else None
+                    except Exception:
+                        cur_ep = None
+                    if (cur_ep is None) or (abs(float(fix_price) - cur_ep) > 1e-6):
+                        entry_price = float(fix_price)
+                        tr.loc[idx, "EntryPrice"] = entry_price
+            except Exception:
+                pass
+
         try:
             if entry_price is None or not np.isfinite(float(entry_price)) or float(entry_price) <= 0:
                 continue
@@ -2173,19 +2570,46 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
 
         cur_close, cur_date = _current_close(t)
         if cur_close is None or cur_date is None:
+            # fetch 실패 시에도 DaysHeld만 ref_date로 갱신 (US는 ref_date+1)
+            ref_date = _get_ref_trading_date(t)
+            if ref_date is not None and signal_date is not None:
+                try:
+                    t_u = (t or "").upper()
+                    is_kr = t_u and (".KS" in t_u or ".KQ" in t_u or t_u.startswith("^K"))
+                    cur_d = ref_date + timedelta(days=1) if not is_kr else ref_date
+                    days_held = max(1, (cur_d - signal_date).days + 1)
+                    tr.loc[idx, "LastBarDate"] = cur_d
+                    tr.loc[idx, "DaysHeld"] = days_held
+                except Exception:
+                    pass
             continue
         cur_close = float(cur_close)
 
-        # DaysHeld 업데이트 (봉 날짜가 바뀔 때만 +1)
+        # DaysHeld 업데이트
+        # 기본 규칙: (오늘 날짜 - SignalDate) + 1  (SignalDate 기준 실 보유 일수)
         prev_last_bar = _ensure_dt(row.get("LastBarDate", None))
         base = int(row.get("DaysHeld", 0) or 0)
 
-        if prev_last_bar is None:
-            days_held = 1 if base <= 0 else base
+        if signal_date is not None:
+            try:
+                delta_days = (cur_date - signal_date).days
+                days_held = max(1, delta_days + 1)
+            except Exception:
+                # 계산 실패 시 기존 로직으로 폴백
+                if prev_last_bar is None:
+                    days_held = 1 if base <= 0 else base
+                else:
+                    if pd.isna(prev_last_bar):
+                        prev_last_bar = cur_date - timedelta(days=1)
+                    days_held = base + 1 if cur_date > prev_last_bar else base
         else:
-            if pd.isna(prev_last_bar):
-                prev_last_bar = cur_date - timedelta(days=1)
-            days_held = base + 1 if cur_date > prev_last_bar else base
+            # SignalDate가 없으면 과거와 동일한 로직 유지
+            if prev_last_bar is None:
+                days_held = 1 if base <= 0 else base
+            else:
+                if pd.isna(prev_last_bar):
+                    prev_last_bar = cur_date - timedelta(days=1)
+                days_held = base + 1 if cur_date > prev_last_bar else base
 
         tr.loc[idx, "LastBarDate"] = cur_date
         tr.loc[idx, "DaysHeld"] = days_held
@@ -2194,7 +2618,6 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
         ret_pct = (cur_close / entry_price - 1) * 100.0
 
         # ✅ 핵심: "당일/첫날엔 exit 판정 금지"
-        signal_date = _ensure_dt(row.get("SignalDate"))
         if signal_date is not None and pd.notna(signal_date) and cur_date <= signal_date:
             # 신호 발생 당일이면 무조건 OPEN 유지
             continue
@@ -2316,7 +2739,7 @@ def compute_open_daily_change_avg(tr: pd.DataFrame) -> float:
     """
     ✅ OPEN 종목들의 '오늘 하루 거래일 동안 변동된 수익률' 평균 (일간 수익률용)
     - 전일 종가 대비 현재가 변동분을 진입가 대비 %로 환산 후 평균
-    - _fetch_recent_close 단일 소스로 종가 일치
+    - 오늘 선정된 종목(EntryDate/SignalDate = 오늘)은 제외 (Return% 0%인데 일간 집계하면 의미 없음)
     """
     if tr is None or not isinstance(tr, pd.DataFrame) or tr.empty:
         return 0.0
@@ -2330,6 +2753,10 @@ def compute_open_daily_change_avg(tr: pd.DataFrame) -> float:
     changes = []
     for _, r in open_df.iterrows():
         t = str(r.get("Ticker", "")).upper().strip()
+        sig_date = _ensure_dt(r.get("SignalDate")) or _ensure_dt(r.get("EntryDate"))
+        ref_date = _get_ref_trading_date(t)
+        if ref_date is not None and sig_date is not None and sig_date == ref_date:
+            continue  # 오늘 선정된 종목 제외
         entry = r.get("EntryPrice", None)
         try:
             if not t or entry is None or not np.isfinite(float(entry)) or float(entry) <= 0:
@@ -3232,7 +3659,7 @@ if page == "🏠 홈":
                 st.code(us_err)
     else:
         for i, n in enumerate(us_news, 1):
-            t = (n.get("title", "") or "").replace("\n", " ").strip()
+            t = _normalize_news_title(n.get("title", "") or "")
             with st.expander(f"{i}. {t}", expanded=False):
                 if n.get("summary"):
                     st.markdown(n["summary"].replace("\n", "\n\n"))
@@ -3253,7 +3680,7 @@ if page == "🏠 홈":
                 st.code(kr_err)
     else:
         for i, n in enumerate(kr_news, 1):
-            t = (n.get("title", "") or "").replace("\n", " ").strip()
+            t = _normalize_news_title(n.get("title", "") or "")
             with st.expander(f"{i}. {t}", expanded=False):
                 if n.get("summary"):
                     st.markdown(n["summary"].replace("\n", "\n\n"))
@@ -3849,8 +4276,17 @@ if page == "KR Stock Scanner":
                     st.code((out or "(empty)")[-12000:])
                 if ok:
                     status.update(label="✅ scanner_kr.py 실행 완료", state="complete")
+                    # 한국 시장 종가 반영: data_refresh_ts + ohlcv.db 삭제로 종목검색/트래커/포트폴리오 최신화
+                    st.session_state["data_refresh_ts"] = datetime.now().isoformat()
                     st.session_state.pop("kr_scan_snap", None)
+                    st.session_state.pop("tp3_tracker", None)
                     st.cache_data.clear()
+                    ohlcv_db = os.path.join(BASE_DIR, "cache", "ohlcv.db")
+                    if os.path.exists(ohlcv_db):
+                        try:
+                            os.remove(ohlcv_db)
+                        except OSError:
+                            pass
                     st.rerun()
                 else:
                     status.update(label="❌ scanner_kr.py 실행 실패/중단", state="error")
@@ -4818,11 +5254,17 @@ with tab3:
 
             if ok:
                 status.update(label="✅ scanner.py 실행 완료", state="complete")
-                # 스캔 성공 시 최신 데이터 반영: data_refresh_ts 설정 후 캐시/스냅/트래커만 정리하고 리런
+                # 미국 시장 종가 반영: data_refresh_ts + ohlcv.db 삭제로 종목검색/트래커 최신화
                 st.session_state["data_refresh_ts"] = datetime.now().isoformat()
                 st.session_state.pop("scan_snap", None)
                 st.session_state.pop("tp3_tracker", None)
                 st.cache_data.clear()
+                ohlcv_db = os.path.join(BASE_DIR, "cache", "ohlcv.db")
+                if os.path.exists(ohlcv_db):
+                    try:
+                        os.remove(ohlcv_db)
+                    except OSError:
+                        pass
                 st.rerun()
             else:
                 status.update(label="❌ scanner.py 실행 실패/중단", state="error")

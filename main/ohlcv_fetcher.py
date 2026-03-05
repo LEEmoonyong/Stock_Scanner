@@ -3,6 +3,7 @@
 OHLCV 조회: 로컬 캐시(SQLite) -> 1차 yfinance -> 2차 Alpha Vantage 폴백.
 - 캐시 hit 시 API 호출 없음.
 - 1차 실패/부족 시 2차 Alpha Vantage 시도 (ALPHA_VANTAGE_API_KEY 필요).
+- 한국 종목(.KS/.KQ): 15:30 KST 장마감 이후엔 FinanceDataReader 우선 (종가 반영 빠름).
 """
 import os
 import sqlite3
@@ -11,6 +12,25 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
+
+def _is_kr_market_closed() -> bool:
+    """한국 장 15:30 KST 마감 이후인지. True면 종가 반영 시점."""
+    # ZoneInfo가 없으면 보수적으로 "장 마감 후"로 간주해서 FDR 우선 사용
+    if ZoneInfo is None:
+        return True
+    try:
+        kst = datetime.now(ZoneInfo("Asia/Seoul"))
+        if kst.weekday() >= 5:
+            return False
+        return (kst.hour > 15) or (kst.hour == 15 and kst.minute >= 30)
+    except Exception:
+        return False
 
 
 def _db_path(base_dir: Optional[str] = None) -> str:
@@ -134,14 +154,20 @@ def fetch_yfinance(ticker: str, start_date, end_date) -> Optional[pd.DataFrame]:
 
 
 def fetch_financedatareader_kr(ticker: str, start_date, end_date) -> Optional[pd.DataFrame]:
-    """한국 주식(.KS/.KQ) FinanceDataReader로 일봉 조회. yfinance 실패 시 폴백."""
-    if not ticker or (".KS" not in ticker.upper() and ".KQ" not in ticker.upper()):
+    """한국 주식/지수(.KS/.KQ, ^KS11/^KQ11 등) FinanceDataReader로 일봉 조회."""
+    if not ticker:
         return None
     try:
         import FinanceDataReader as fdr
-        code = ticker.replace(".KS", "").replace(".KQ", "").strip()
-        if not code or not code.isdigit():
-            return None
+        t = ticker.upper().strip()
+        # 1) 코스피/코스닥 지수(^KS11, ^KQ11 등)
+        if t.startswith("^KS") or t.startswith("^KQ"):
+            code = t.replace("^", "").replace(".KS", "").replace(".KQ", "").strip()
+        else:
+            # 2) 개별 종목(.KS/.KQ)
+            code = t.replace(".KS", "").replace(".KQ", "").strip()
+            if not code or not code.isdigit():
+                return None
         start_s = pd.Timestamp(start_date).strftime("%Y-%m-%d")
         end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
         df = fdr.DataReader(code, start_s, end_s)
@@ -224,30 +250,60 @@ def fetch_ohlcv_with_fallback(
     end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
     db_path = _db_path(base_dir)
 
+    t_upper = ticker.upper()
+    is_kr = (".KS" in t_upper) or (".KQ" in t_upper) or t_upper.startswith("^K")
+    kr_prefer_fdr = is_kr and _is_kr_market_closed()  # 15:30 KST 이후 종가 반영
+    end_d = pd.Timestamp(end_date).date()
+
+    # KR 15:30 이후 + 오늘 데이터 필요 시: 캐시 스킵하고 FDR 직접 조회 (종가 정확 반영)
+    if kr_prefer_fdr and ZoneInfo:
+        try:
+            today_kst = datetime.now(ZoneInfo("Asia/Seoul")).date()
+            if end_d >= today_kst and today_kst.weekday() < 5:
+                df_fdr_first = fetch_financedatareader_kr(ticker, start_s, end_s)
+                if df_fdr_first is not None and len(df_fdr_first) >= min_rows:
+                    save_cached_ohlcv(ticker, df_fdr_first, db_path)
+                    return df_fdr_first
+        except Exception:
+            pass
+
     # 1) 캐시
     cached = get_cached_ohlcv(ticker, start_s, end_s, db_path)
-    # 갭 채우기: 캐시 마지막 날이 end_date보다 이전이면 부족 구간만 yf로 조회 후 저장·재조회
+    # 갭 채우기: 캐시 마지막 날이 end_date보다 이전이면 부족 구간만 조회 후 저장·재조회
     if cached is not None and not cached.empty:
-        end_d = pd.Timestamp(end_date).date()
         last_cached = cached.index.max()
         last_d = pd.Timestamp(last_cached).date() if last_cached is not pd.NaT else None
         if last_d is not None and last_d < end_d:
             fill_start = (pd.Timestamp(last_d) + timedelta(days=1)).strftime("%Y-%m-%d")
-            fill_df = fetch_yfinance(ticker, fill_start, end_s)
+            fill_df = None
+            if kr_prefer_fdr:
+                fill_df = fetch_financedatareader_kr(ticker, fill_start, end_s)
+            if fill_df is None or fill_df.empty:
+                fill_df = fetch_yfinance(ticker, fill_start, end_s)
             if fill_df is not None and not fill_df.empty:
                 save_cached_ohlcv(ticker, fill_df, db_path)
                 cached = get_cached_ohlcv(ticker, start_s, end_s, db_path)
+            elif kr_prefer_fdr:
+                # KR 15:30 이후 캐시 갭 채우기 실패 시 → 캐시 반환 스킵, FDR 직접 조회로 진행
+                cached = None
     if cached is not None and len(cached) >= min_rows:
         return cached
 
-    # 2) yfinance
+    # 2) 한국 15:30 이후: FinanceDataReader 우선 (종가 반영 빠름)
+    if kr_prefer_fdr:
+        df_fdr = fetch_financedatareader_kr(ticker, start_s, end_s)
+        if df_fdr is not None and len(df_fdr) >= min_rows:
+            save_cached_ohlcv(ticker, df_fdr, db_path)
+            return df_fdr
+
+    # 3) yfinance
     df = fetch_yfinance(ticker, start_s, end_s)
     if df is not None and len(df) >= min_rows:
         save_cached_ohlcv(ticker, df, db_path)
         return df
 
-    # 2b) 한국 주식: FinanceDataReader 폴백
-    if ".KS" in ticker.upper() or ".KQ" in ticker.upper():
+    # 4) 한국 주식: FinanceDataReader 폴백 (yf 실패 시)
+    if is_kr:
         df_fdr = fetch_financedatareader_kr(ticker, start_s, end_s)
         if df_fdr is not None and len(df_fdr) >= min_rows:
             save_cached_ohlcv(ticker, df_fdr, db_path)
@@ -255,7 +311,7 @@ def fetch_ohlcv_with_fallback(
         if df_fdr is not None and not df_fdr.empty:
             df = df_fdr
 
-    # 3) Alpha Vantage
+    # 5) Alpha Vantage
     api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()
     if api_key:
         df = fetch_alpha_vantage(ticker, start_s, end_s, api_key)

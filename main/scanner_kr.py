@@ -1,4 +1,4 @@
-# scanner_kr.py
+ # scanner_kr.py
 # -----------------------------
 # 한국 증시 전용 스캐너 (코스피 100 유니버스)
 # ticker_universe_kr.TICKERS 사용, kr_scan_snapshot_*.json 출력
@@ -128,8 +128,18 @@ def compute_market_state_kr(data):
     indices_score = 0.0
     for sym, label in [("^KS11", "KOSPI"), ("^KQ11", "KOSDAQ")]:
         df = _get_kr_df(data, sym)
-        info = {"close": None, "sma50": None, "sma200": None, "above_sma50": None, "above_sma200": None,
-                "adx": None, "vol_ratio": None, "return_5d": None, "return_20d": None}
+        info = {
+            "close": None,
+            "sma50": None,
+            "sma200": None,
+            "above_sma50": None,
+            "above_sma200": None,
+            "adx": None,
+            "vol_ratio": None,
+            "return_1d": None,
+            "return_5d": None,
+            "return_20d": None,
+        }
         if df is not None and len(df) >= 60:
             last, s50 = _get_close_sma(df, 50)
             _, s200 = _get_close_sma(df, 200)
@@ -151,6 +161,8 @@ def compute_market_state_kr(data):
             except Exception:
                 pass
             info["vol_ratio"] = _get_vol_ratio(df)
+            # 1일 / 5일 / 20일 수익률
+            info["return_1d"] = _get_return(df, 1)
             info["return_5d"] = _get_return(df, 5)
             info["return_20d"] = _get_return(df, 20)
         out["kospi" if label == "KOSPI" else "kosdaq"] = info
@@ -248,20 +260,51 @@ def compute_market_state_kr(data):
             vol_score = -15.0
     out["components"]["vol_ratio"] = round(vol_score, 1)
 
+    # 일간 급등/급락 점수 (특히 폭락장 반영)
+    day_score = 0.0
+    kospi_ret1 = kospi_info.get("return_1d")
+    kosdaq_info = out.get("kosdaq", {})
+    kosdaq_ret1 = kosdaq_info.get("return_1d") if isinstance(kosdaq_info, dict) else None
+
+    # KOSPI/KOSDAQ 중 더 나쁜(낮은) 1일 수익률 기준으로 평가
+    rets = [r for r in [kospi_ret1, kosdaq_ret1] if r is not None]
+    if rets:
+        worst = min(rets)
+        # 큰 폭 하락일수록 강하게 페널티
+        if worst <= -7.0:
+            day_score = -60.0
+        elif worst <= -5.0:
+            day_score = -40.0
+        elif worst <= -3.0:
+            day_score = -25.0
+        elif worst <= -2.0:
+            day_score = -15.0
+        elif worst >= 3.0:
+            # 큰 폭 상승장은 약한 가산점만
+            day_score = 10.0
+    out["components"]["day_return"] = round(day_score, 1)
+
     # KOSPI vs KOSDAQ 상대강도 (성장주 vs 가치주)
     sector_score = 0.0
     kospi_above = kospi_info.get("above_sma50")
     kosdaq_info = out.get("kosdaq", {})
     kosdaq_above = kosdaq_info.get("above_sma50")
+    kospi_ret1 = kospi_info.get("return_1d")
+    kosdaq_ret1 = kosdaq_info.get("return_1d") if isinstance(kosdaq_info, dict) else None
     if kospi_above is not None and kosdaq_above is not None:
         if kosdaq_above and not kospi_above:
             sector_score = 20.0
             out["kospi_vs_kosdaq"] = "growth_lead"
+            # 단기 등락과 무관하게 "강함" 표현 유지
             out["kospi_vs_kosdaq_label"] = "KOSDAQ 강함 (성장주 선호)"
         elif kosdaq_above and kospi_above:
             sector_score = 10.0
             out["kospi_vs_kosdaq"] = "growth_lead"
-            out["kospi_vs_kosdaq_label"] = "KOSDAQ·KOSPI 모두 상승 (성장주 선호)"
+            # 양 지수 모두 상승 추세지만, 당일 수익률이 음수면 '상승' 대신 '조정'으로 표현
+            if (kospi_ret1 is not None and kospi_ret1 < 0) or (kosdaq_ret1 is not None and kosdaq_ret1 < 0):
+                out["kospi_vs_kosdaq_label"] = "KOSDAQ·KOSPI 상승 추세, 단기 조정 (성장주 선호)"
+            else:
+                out["kospi_vs_kosdaq_label"] = "KOSDAQ·KOSPI 모두 상승 (성장주 선호)"
         elif not kosdaq_above and kospi_above:
             sector_score = -10.0
             out["kospi_vs_kosdaq"] = "value_lead"
@@ -272,12 +315,13 @@ def compute_market_state_kr(data):
             out["kospi_vs_kosdaq_label"] = "KOSDAQ·KOSPI 모두 하락 (방어적)"
     out["components"]["sector"] = round(sector_score, 1)
 
-    # return_5d, return_20d 저장
+    # return_1d, return_5d, return_20d 저장
+    out["return_1d"] = {"KOSPI": kospi_info.get("return_1d"), "KOSDAQ": kosdaq_info.get("return_1d")}
     out["return_5d"] = {"KOSPI": kospi_info.get("return_5d"), "KOSDAQ": kosdaq_info.get("return_5d")}
     out["return_20d"] = {"KOSPI": kospi_info.get("return_20d"), "KOSDAQ": kosdaq_info.get("return_20d")}
 
     # 최종 점수
-    raw = indices_score + adx_score + vix_score + vol_score + sector_score
+    raw = indices_score + adx_score + vix_score + vol_score + sector_score + day_score
     score = max(0.0, min(100.0, 50.0 + raw * 0.5))
     out["score"] = round(score, 1)
     if score <= 33.0:
@@ -294,7 +338,11 @@ def compute_market_state_kr(data):
         if t in ("^KS11", "^KQ11", "069500.KS"):
             continue
         sec = TICKER_TO_SECTOR.get(t)
+        # 섹터명이 없거나 'Unknown' 등 의미 없는 값이면 제외
         if not sec:
+            continue
+        sec_str = str(sec).strip()
+        if not sec_str or sec_str.upper() in {"UNKNOWN", "UNCLASSIFIED", "OTHER", "MISC"}:
             continue
         df_t = _get_kr_df(data, ticker)
         if df_t is None or len(df_t) < 6 or "Close" not in df_t.columns:
@@ -305,9 +353,9 @@ def compute_market_state_kr(data):
                 continue
             ret_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
             if np.isfinite(ret_5d):
-                if sec not in sector_returns:
-                    sector_returns[sec] = []
-                sector_returns[sec].append(ret_5d)
+                if sec_str not in sector_returns:
+                    sector_returns[sec_str] = []
+                sector_returns[sec_str].append(ret_5d)
         except Exception:
             continue
     top3 = []
